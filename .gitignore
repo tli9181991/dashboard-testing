@@ -1,0 +1,6 @@
+.env
+.venv
+.vscode
+.screen_cache
+__pycache__
+setting.json
