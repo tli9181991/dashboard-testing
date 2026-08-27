@@ -41,70 +41,79 @@ def estimate_sr_levels(df: pd.DataFrame, swing_lookback: int = 3, prominence_fra
     return _merge_levels(levels_raw, price_tol=price_tol)
 
 class SwingBreakoutMonitor:
-    def __init__(self, symbol: str, existing_positions: list = None, max_pos: int = 5, pos_size_usd: float = 500.0, stock_share_size: int = 6):
-        self.positions = existing_positions if existing_positions is not None else []
+    def __init__(self, symbol: str, avg_price: float = 0.0, total_amount: float = 0.0, max_pos: int = 5, pos_size_usd: float = 500.0, stock_share_size: int = 6, long_term: bool = False):
+        self.symbol = symbol
+        self.avg_price = avg_price
+        self.total_amount = total_amount
         self.max_pos = max_pos
         self.pos_size_usd = pos_size_usd
         self.stock_share_size = stock_share_size
-        self.symbol = symbol
+        self.long_term = long_term
         self.is_crypto = "-USD" in self.symbol.upper()
         self.cache_file = CACHE_DIR / f"{self.symbol.replace('-', '_')}_price_history.csv"
         
     def fetch_data(self, force_refresh: bool = False) -> pd.DataFrame:
-        # 1. Try to load from cache
         if not force_refresh and os.path.exists(self.cache_file):
             try:
                 df = pd.read_csv(self.cache_file, index_col=0, parse_dates=True)
-                # Verify the cache isn't empty AND has the correct SMA_10 column
-                if not df.empty and 'SMA_10' in df.columns: 
+                if not df.empty and 'SMA_10' in df.columns and 'EMA_200' in df.columns: 
                     return df
-            except Exception: 
-                pass
+            except Exception: pass
 
-        # 2. If cache fails or is missing the column, fetch fresh data
-        df = yf.download(self.symbol, period='6mo', interval='1d', progress=False)
+        df = yf.download(self.symbol, period='2y', interval='1d', progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [col[0] for col in df.columns]
         df.dropna(inplace=True)
         
-        # Calculate the new 10 SMA
         df['SMA_10'] = df['Close'].rolling(window=10).mean()
+        df['EMA_5'] = df['Close'].ewm(span=5, adjust=False).mean()
+        df['EMA_10'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
         
-        # Overwrite the old cache file with the new data
         df.to_csv(self.cache_file)
         return df
-    
+
     def evaluate_market(self, force_refresh: bool = False):
         df = self.fetch_data(force_refresh=force_refresh)
         current_price = float(df['Close'].iloc[-1])
         current_sma10 = float(df['SMA_10'].iloc[-1])
         
-        # Calculate PnL conditionally based on asset type
         if self.is_crypto:
-            total_pnl = sum(((current_price - p) / p) * self.pos_size_usd for p in self.positions)
+            pos_count = int(self.total_amount / self.pos_size_usd) if self.pos_size_usd > 0 else 0
         else:
-            total_pnl = sum((current_price - p) * self.stock_share_size for p in self.positions)
+            pos_count = int(self.total_amount / self.stock_share_size) if self.stock_share_size > 0 else 0
+
+        total_pnl = 0.0
+        if self.total_amount > 0 and self.avg_price > 0:
+            if self.is_crypto:
+                total_pnl = ((current_price - self.avg_price) / self.avg_price) * self.total_amount
+            else:
+                total_pnl = (current_price - self.avg_price) * self.total_amount
             
         log_msgs = []
         signal = "HOLD"
         
-        # Rule 1: Trailing Exit Condition (Close below 10 SMA)
-        if current_price < current_sma10:
-            log_msgs.append(f"🚨 EXIT SIGNAL: Current Price (${current_price:,.2f}) closed below 10 SMA (${current_sma10:,.2f}).")
-            if self.positions:
-                invested = len(self.positions) * self.pos_size_usd if self.is_crypto else sum(p * self.stock_share_size for p in self.positions)
-                log_msgs.append(f"Action: LIQUIDATE ALL positions (Total Capital Invested: ${invested:,.2f}).")
-                signal = "SELL"
-                self.positions = [] 
-            return df, current_price, current_sma10, total_pnl, signal, log_msgs
-
-        # Rule 2: Breakout Entry Condition
-        log_msgs.append("✅ Trend intact (Price > 10 SMA). Evaluating breakout levels...")
+        # Calculate Resistance Levels FIRST so they can be returned even on a SELL signal
         levels = estimate_sr_levels(df)
         resistances = sorted([l for l in levels if l[2] == 'resistance'], key=lambda x: x[1])
-        
         nearest_broken_res = next((price for _, price, _, _ in reversed(resistances) if price < current_price), None)
         next_overhead_res = next((price for _, price, _, _ in resistances if price > current_price), None)
+        
+        # Rule 1: Trailing Exit Condition (Close below 10 SMA)
+        if current_price < current_sma10:
+            if self.long_term:
+                log_msgs.append(f"⚠️ Price (${current_price:,.2f}) is below 10 SMA (${current_sma10:,.2f}). Holding due to LONG-TERM strategy flag.")
+            else:
+                log_msgs.append(f"🚨 EXIT SIGNAL: Current Price (${current_price:,.2f}) closed below 10 SMA (${current_sma10:,.2f}).")
+                if self.total_amount > 0:
+                    log_msgs.append("Action: LIQUIDATE ALL.")
+                    signal = "SELL"
+                # Return 7 values here
+                return df, current_price, current_sma10, total_pnl, signal, next_overhead_res, log_msgs
+
+        # Rule 2: Breakout Entry Condition
+        log_msgs.append("✅ Evaluating breakout levels...")
 
         if next_overhead_res: log_msgs.append(f"🎯 Target Overhead Resistance: ${next_overhead_res:,.2f}")
 
@@ -112,18 +121,16 @@ class SwingBreakoutMonitor:
             pct_above_breakout = (current_price - nearest_broken_res) / nearest_broken_res
             if 0 < pct_above_breakout < 0.02:
                 log_msgs.append(f"💡 FRESH BREAKOUT: Price is {pct_above_breakout*100:.2f}% above resistance (${nearest_broken_res:,.2f}).")
-                if len(self.positions) < self.max_pos:
+                if pos_count < self.max_pos:
                     if self.is_crypto:
-                        units = self.pos_size_usd / current_price
-                        log_msgs.append(f"🚀 BUY SIGNAL: Triggering entry for ${self.pos_size_usd:,.2f} USD (~{units:.4f} units @ ${current_price:,.2f}).")
+                        log_msgs.append(f"🚀 BUY SIGNAL: Triggering entry for ${self.pos_size_usd:,.2f} USD @ ${current_price:,.2f}.")
                     else:
                         log_msgs.append(f"🚀 BUY SIGNAL: Triggering entry for {self.stock_share_size} shares @ ${current_price:,.2f}.")
-                    
-                    self.positions.append(current_price)
                     signal = "BUY"
                 else:
                     log_msgs.append(f"⚠️ CAP REACHED: Max limit of {self.max_pos} positions active.")
             else:
                 log_msgs.append(f"⏳ Holding. Current price maintains buffer above resistance (${nearest_broken_res:,.2f}).")
 
-        return df, current_price, current_sma10, total_pnl, signal, log_msgs
+        # Return 7 values here
+        return df, current_price, current_sma10, total_pnl, signal, next_overhead_res, log_msgs
