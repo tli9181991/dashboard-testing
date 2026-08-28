@@ -1,12 +1,28 @@
-streamlit>=1.30.0
-yfinance>=0.2.54
+# Core numerics / strategy / backtest
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0
+
+# Data + dashboard
+yfinance>=0.2.54
+streamlit>=1.30.0
 plotly>=5.18.0
-langchain-google-genai
+python-dotenv
+
+# Screener (S&P 500 scrape) - these were imported but never declared
+requests
+beautifulsoup4
+
+# Scheduler (scheduler.py) - also previously undeclared
+apscheduler
+pytz
+
+# AI features
 langchain
 langchain-community
+langchain-google-genai
 duckduckgo-search
 pydantic
-python-dotenv
+
+# Tests
+pytest>=7.0

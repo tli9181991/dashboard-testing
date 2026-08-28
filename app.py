@@ -7,39 +7,21 @@ import yfinance as yf
 from datetime import datetime
 
 from config import (
-    GOOGLE_API_KEY, DEFAULT_POS_SIZE_USD, DEFAULT_MAX_POS,
+    GOOGLE_API_KEY, ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
+    USE_REGIME_GATE, REGIME_BENCHMARK,
     SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT
 )
+import data as data_mod
 from breakout import SwingBreakoutMonitor
+from positions import load_portfolio, conversion_notes
+from sizing import SizingParams
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
 
-PORTFOLIO_FILE = "portfolio.csv"
-
 # =============================================================================
 # Helper Functions
 # =============================================================================
-def load_portfolio():
-    if not os.path.exists(PORTFOLIO_FILE):
-        df = pd.DataFrame(columns=["ticker", "averaged_price", "total_amount", "long_term"])
-        df.to_csv(PORTFOLIO_FILE, index=False)
-        return {}
-    
-    df = pd.read_csv(PORTFOLIO_FILE)
-    if "total_ammount" in df.columns:
-        df.rename(columns={"total_ammount": "total_amount"}, inplace=True)
-        
-    port = {}
-    for _, row in df.iterrows():
-        is_long = str(row.get('long_term', 'False')).strip().lower() in ['true', '1', 'yes', 'y', 't']
-        port[row['ticker'].strip().upper()] = {
-            "averaged_price": float(row['averaged_price']),
-            "total_amount": float(row['total_amount']),
-            "long_term": is_long
-        }
-    return port
-
 @st.cache_data(ttl=3600)
 def fetch_normalized_sector_prices(tickers: list) -> pd.DataFrame:
     if not tickers: return pd.DataFrame()
@@ -62,54 +44,92 @@ st.title("🚀 Automated Portfolio, Screening & Dashboard")
 
 st.sidebar.header("Agent Settings")
 refresh_rate = st.sidebar.slider("Refresh Interval (s)", 5, 300, 30)
-max_pos = st.sidebar.number_input("Max Positions per Asset", value=DEFAULT_MAX_POS, min_value=1)
 force_data_refresh = st.sidebar.button("🔄 Force Refresh Market Data")
 auto_refresh_paused = st.sidebar.checkbox("⏸️ Pause Auto-Refresh (Turn on when chatting)")
 
-portfolio_data = load_portfolio()
-portfolio_tickers = list(portfolio_data.keys())
+st.sidebar.header("Risk")
+account_equity = st.sidebar.number_input("Account Equity ($)", value=float(ACCOUNT_EQUITY), min_value=1000.0, step=1000.0)
+target_vol = st.sidebar.slider("Target Volatility per Position", 0.05, 0.50, float(TARGET_VOL), 0.01,
+                               help="Annualised volatility budget. Size scales inversely with each name's own volatility.")
+max_position_pct = st.sidebar.slider("Max Position Size (% of equity)", 0.05, 1.00, float(MAX_POSITION_PCT), 0.05)
+use_regime_gate = st.sidebar.checkbox("Regime gate on new entries", value=USE_REGIME_GATE,
+                                      help=f"Block new entries while {REGIME_BENCHMARK} trades below its 200 SMA. Exits are never gated.")
+
+sizing_params = SizingParams(target_vol=target_vol, max_position_pct=max_position_pct)
+
+holdings = load_portfolio()
+portfolio_tickers = list(holdings.keys())
 
 if not portfolio_tickers:
     st.warning("⚠️ `portfolio.csv` is empty or missing. Please add tickers to the file to monitor.")
     st.stop()
 
-all_dfs = {}
-all_logs = {}
+for note in conversion_notes(holdings):
+    st.sidebar.caption(f"ℹ️ {note}")
+
+benchmark_close = None
+regime_label = "off"
+if use_regime_gate:
+    bench = data_mod.load_history(REGIME_BENCHMARK, period="2y")
+    if bench.empty:
+        st.warning(f"Could not load {REGIME_BENCHMARK}; running without the regime gate.")
+    else:
+        benchmark_close = bench["Close"]
+
+views = {}
 summary_data = []
 total_portfolio_pnl = 0.0
+failed = []
 
-for ticker in portfolio_tickers:
-    bot = SwingBreakoutMonitor(
-        symbol=ticker, 
-        avg_price=portfolio_data[ticker]["averaged_price"],
-        total_amount=portfolio_data[ticker]["total_amount"],
-        max_pos=max_pos, 
-        pos_size_usd=DEFAULT_POS_SIZE_USD,
-        stock_share_size=6,
-        long_term=portfolio_data[ticker]["long_term"]
+for ticker, holding in holdings.items():
+    monitor = SwingBreakoutMonitor(
+        symbol=ticker,
+        position=holding.position,
+        equity=account_equity,
+        sizing_params=sizing_params,
     )
-    
-    df, current_price, sma10, pnl, signal, next_res, logs = bot.evaluate_market(force_refresh=force_data_refresh)
-    
-    all_dfs[ticker] = df
-    all_logs[ticker] = logs
-    total_portfolio_pnl += pnl
-    
+    try:
+        view = monitor.evaluate_market(force_refresh=force_data_refresh, benchmark_close=benchmark_close)
+    except Exception as exc:
+        failed.append(f"{ticker}: {exc}")
+        continue
+
+    views[ticker] = view
+    total_portfolio_pnl += view.unrealized_pnl
+    regime_label = "risk-on" if view.regime_ok else "risk-off"
+
     summary_data.append({
         "Ticker": ticker,
-        "Current Price": f"${current_price:,.2f}",
-        "10 SMA": f"${sma10:,.2f}",
-        "Next Resistance": f"${next_res:,.2f}" if next_res is not None else "N/A",
-        "Avg Cost": f"${portfolio_data[ticker]['averaged_price']:,.2f}" if portfolio_data[ticker]['averaged_price'] > 0 else "$0.00",
-        "Total Amount/Shares": f"{portfolio_data[ticker]['total_amount']:.2f}" if bot.is_crypto else f"{int(portfolio_data[ticker]['total_amount'])}",
-        "Unrealized PnL": f"${pnl:,.2f}",
-        "Long Term": "Yes" if portfolio_data[ticker]["long_term"] else "No",
-        "Signal": signal
+        "Current Price": f"${view.price:,.2f}",
+        "10 SMA": f"${view.decision.sma_exit:,.2f}",
+        "Next Resistance": f"${view.decision.next_resistance:,.2f}" if view.decision.next_resistance else "N/A",
+        "Avg Cost": f"${holding.position.avg_price:,.2f}" if holding.position.avg_price > 0 else "$0.00",
+        "Quantity": f"{holding.quantity:,.6f}".rstrip("0").rstrip(".") if holding.asset_class.value == "crypto" else f"{holding.quantity:,.0f}",
+        "Ann. Vol": f"{view.ann_vol:.1%}",
+        "Target Size": f"{view.target_quantity:,.4f}".rstrip("0").rstrip(".") if holding.asset_class.value == "crypto" else f"{view.target_quantity:,.0f}",
+        "Target $": f"${view.target_notional:,.0f}",
+        "Unrealized PnL": f"${view.unrealized_pnl:,.2f}",
+        "Long Term": "Yes" if holding.position.long_term else "No",
+        "Signal": view.signal,
     })
 
-m1, m2 = st.columns(2)
-m1.metric("Total Monitored Assets", len(portfolio_tickers))
-m2.metric("Aggregate Portfolio Unrealized PnL", f"${total_portfolio_pnl:,.2f}", delta_color="normal" if total_portfolio_pnl >= 0 else "inverse")
+for message in failed:
+    st.error(f"⚠️ {message}")
+
+if not views:
+    st.error("No symbols could be evaluated. Check connectivity, then press Force Refresh.")
+    st.stop()
+
+portfolio_tickers = list(views.keys())
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Monitored Assets", len(portfolio_tickers))
+m2.metric("Aggregate Unrealized PnL", f"${total_portfolio_pnl:,.2f}",
+          delta_color="normal" if total_portfolio_pnl >= 0 else "inverse")
+m3.metric("Market Regime", regime_label.upper() if use_regime_gate and benchmark_close is not None else "GATE OFF")
+
+if use_regime_gate and benchmark_close is not None and regime_label == "risk-off":
+    st.info(f"🚦 {REGIME_BENCHMARK} is below its 200 SMA — new entries are vetoed. Exits are unaffected.")
 
 st.markdown("---")
 
@@ -137,8 +157,8 @@ if SHOW_TAB_BREAKOUT:
         col1, col2 = st.columns([2, 1])
         with col1:
             chart_ticker = st.selectbox("Select Asset to Chart:", portfolio_tickers)
-            active_df = all_dfs[chart_ticker]
-            avg_entry = portfolio_data[chart_ticker]['averaged_price']
+            active_df = views[chart_ticker].df
+            avg_entry = holdings[chart_ticker].position.avg_price
             
             fig = go.Figure()
             fig.add_trace(go.Candlestick(x=active_df.index, open=active_df['Open'], high=active_df['High'], low=active_df['Low'], close=active_df['Close'], name=chart_ticker))
@@ -148,7 +168,7 @@ if SHOW_TAB_BREAKOUT:
             fig.add_trace(go.Scatter(x=active_df.index, y=active_df['EMA_20'], mode='lines', name='20 EMA', line=dict(color='#00FF00', width=1)))
             fig.add_trace(go.Scatter(x=active_df.index, y=active_df['EMA_200'], mode='lines', name='200 EMA', line=dict(color='#FFFFFF', width=2)))
             
-            if portfolio_data[chart_ticker]['total_amount'] > 0:
+            if holdings[chart_ticker].quantity > 0:
                 fig.add_hline(y=avg_entry, line_dash="dot", line_color="green", annotation_text=f"Avg Entry ${avg_entry:,.2f}")
                 
             fig.update_layout(
@@ -170,13 +190,20 @@ if SHOW_TAB_BREAKOUT:
             
         with col2:
             st.subheader(f"Execution Stream: {chart_ticker}")
-            active_signal = summary_df.loc[summary_df['Ticker'] == chart_ticker, 'Signal'].values[0]
-            if active_signal == "BUY": st.success("🟢 **BUY SIGNAL DETECTED**")
-            elif active_signal == "SELL": st.error("🔴 **SELL ALL SIGNAL DETECTED**")
-            else: st.info("🟡 **HOLDING**: Trend intact or Long-Term rule active.")
-            
-            for msg in all_logs[chart_ticker]:
+            active_view = views[chart_ticker]
+            if active_view.signal == "BUY":
+                st.success("🟢 **BUY SIGNAL**")
+                st.caption(f"Vol-targeted size: {active_view.target_quantity:,.4f} units "
+                           f"(${active_view.target_notional:,.0f}) at {active_view.ann_vol:.1%} annualised vol.")
+            elif active_view.signal == "SELL":
+                st.error("🔴 **SELL ALL SIGNAL**")
+            else:
+                st.info("🟡 **HOLDING**")
+
+            for msg in active_view.logs:
                 st.text(f"• {msg}")
+
+            st.caption(f"Bars through {active_view.df.index[-1]:%Y-%m-%d} (completed sessions only).")
     tab_index += 1
 
 # TAB 2: Stock Selection Screener

@@ -20,7 +20,17 @@ DEFAULT_MAX_POS = int(os.getenv("MAX_POS", "5"))
 SHOW_TAB_BREAKOUT = parse_bool(os.getenv("SHOW_TAB_BREAKOUT"), True)
 SHOW_TAB_SCREENER = parse_bool(os.getenv("SHOW_TAB_SCREENER"), True)
 SHOW_TAB_SENTIMENT = parse_bool(os.getenv("SHOW_TAB_SENTIMENT"), True)
+# app.py has always imported SHOW_TAB_CHATBOT; only SHOW_TAB_PORTFOLIO was defined,
+# so importing app.py raised ImportError before this was added.
+SHOW_TAB_CHATBOT = parse_bool(os.getenv("SHOW_TAB_CHATBOT"), True)
 SHOW_TAB_PORTFOLIO = parse_bool(os.getenv("SHOW_TAB_PORTFOLIO"), False)
+
+# Risk & sizing defaults (see sizing.py / regime.py)
+ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY", "100000.0"))
+TARGET_VOL = float(os.getenv("TARGET_VOL", "0.15"))
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.25"))
+USE_REGIME_GATE = parse_bool(os.getenv("USE_REGIME_GATE"), True)
+REGIME_BENCHMARK = os.getenv("REGIME_BENCHMARK", "^GSPC")
 
 # Cache Directories & Local File Paths
 CACHE_DIR = Path("./.screen_cache")
