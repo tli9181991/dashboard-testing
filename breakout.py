@@ -1,136 +1,165 @@
-import os
-import numpy as np
+"""Live monitoring path.
+
+This is a thin shell around ``strategy.evaluate`` — the same function the
+backtester calls. All trading logic lives in ``strategy.py``; if you change a rule,
+change it there and both paths move together. A live path with its own copy of the
+rules is a backtest that silently stops describing the system you are running.
+
+Responsibilities kept here: fetching bars, expiring the cache, dropping the
+still-forming bar, applying the regime gate, and reporting a vol-targeted size.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Optional
+
 import pandas as pd
-import yfinance as yf
-from scipy.signal import find_peaks
+
+import regime as regime_mod
+import sizing as sizing_mod
 from config import CACHE_DIR
+from strategy import (
+    Action,
+    AssetClass,
+    Decision,
+    Position,
+    StrategyParams,
+    drop_forming_bar,
+    evaluate,
+    prepare,
+)
 
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c = df['High'], df['Low'], df['Close']
-    tr = np.maximum(h - l, np.maximum((h - c.shift()).abs(), (l - c.shift()).abs()))
-    return tr.rolling(n, min_periods=1).mean()
+#: Cached bars older than this are refetched. The original code cached price
+#: history forever, so a dashboard that auto-refreshed every 30 seconds could sit
+#: on days-old prices while looking live.
+CACHE_TTL_SECONDS = 60 * 30
 
-def _merge_levels(levels: list, price_tol: float) -> list:
-    if not levels: return []
-    levels = sorted(levels, key=lambda x: (x[1], x[0]))
-    merged, cur_times = [], [levels[0][0]]
-    cur_price, cur_kind, touches = levels[0][1], levels[0][2], 1
 
-    for t, p, k in levels[1:]:
-        if (abs(p - cur_price) <= price_tol) and (k == cur_kind):
-            cur_price = (cur_price * touches + p) / (touches + 1)
-            touches += 1
-            cur_times.append(t)
-        else:
-            merged.append((cur_times, cur_price, cur_kind, touches))
-            cur_times, cur_price, cur_kind, touches = [t], p, k, 1
-    merged.append((cur_times, cur_price, cur_kind, touches))
-    return merged
+@dataclass
+class MarketView:
+    """Everything the dashboard needs for one symbol."""
 
-def estimate_sr_levels(df: pd.DataFrame, swing_lookback: int = 3, prominence_frac: float = 0.015, atr_window: int = 14) -> list:
-    close, high, low = df['Close'], df['High'], df['Low']
-    prom = max(1e-6, prominence_frac * float(close.iloc[-1]))
-    peaks, _ = find_peaks(high.values, distance=swing_lookback, prominence=prom)
-    troughs, _ = find_peaks((-low).values, distance=swing_lookback, prominence=prom)
+    symbol: str
+    df: pd.DataFrame
+    decision: Decision
+    position: Position
+    asset_class: AssetClass
+    unrealized_pnl: float
+    ann_vol: float
+    target_quantity: float
+    regime_ok: bool
 
-    levels_raw = [(df.index[i], float(high.iloc[i]), 'resistance') for i in peaks]
-    levels_raw += [(df.index[i], float(low.iloc[i]), 'support') for i in troughs]
+    @property
+    def price(self) -> float:
+        return self.decision.price
 
-    avg_atr = float(atr(df, atr_window).mean())
-    price_tol = max(1e-6, 1.0 * avg_atr)
-    return _merge_levels(levels_raw, price_tol=price_tol)
+    @property
+    def signal(self) -> str:
+        return self.decision.action.value
+
+    @property
+    def logs(self) -> tuple[str, ...]:
+        return self.decision.logs
+
+    @property
+    def target_notional(self) -> float:
+        return self.target_quantity * self.price
+
 
 class SwingBreakoutMonitor:
-    def __init__(self, symbol: str, avg_price: float = 0.0, total_amount: float = 0.0, max_pos: int = 5, pos_size_usd: float = 500.0, stock_share_size: int = 6, long_term: bool = False):
-        self.symbol = symbol
-        self.avg_price = avg_price
-        self.total_amount = total_amount
-        self.max_pos = max_pos
-        self.pos_size_usd = pos_size_usd
-        self.stock_share_size = stock_share_size
-        self.long_term = long_term
-        self.is_crypto = "-USD" in self.symbol.upper()
+    def __init__(
+        self,
+        symbol: str,
+        position: Position = Position(),
+        equity: float = 100_000.0,
+        params: StrategyParams = StrategyParams(),
+        sizing_params: sizing_mod.SizingParams = sizing_mod.SizingParams(),
+        period: str = "2y",
+    ):
+        self.symbol = symbol.upper()
+        self.position = position
+        self.equity = equity
+        self.params = params
+        self.sizing_params = sizing_params
+        self.period = period
+        self.asset_class = AssetClass.infer(self.symbol)
         self.cache_file = CACHE_DIR / f"{self.symbol.replace('-', '_')}_price_history.csv"
-        
-    def fetch_data(self, force_refresh: bool = False) -> pd.DataFrame:
-        if not force_refresh and os.path.exists(self.cache_file):
-            try:
-                df = pd.read_csv(self.cache_file, index_col=0, parse_dates=True)
-                if not df.empty and 'SMA_10' in df.columns and 'EMA_200' in df.columns: 
-                    return df
-            except Exception: pass
 
-        df = yf.download(self.symbol, period='2y', interval='1d', progress=False)
+    @property
+    def is_crypto(self) -> bool:
+        return self.asset_class is AssetClass.CRYPTO
+
+    def _cache_is_fresh(self) -> bool:
+        if not self.cache_file.exists():
+            return False
+        return (time.time() - self.cache_file.stat().st_mtime) < CACHE_TTL_SECONDS
+
+    def fetch_data(self, force_refresh: bool = False) -> pd.DataFrame:
+        if not force_refresh and self._cache_is_fresh():
+            try:
+                cached = pd.read_csv(self.cache_file, index_col=0, parse_dates=True)
+                if not cached.empty:
+                    return cached
+            except Exception:
+                pass
+
+        import yfinance as yf
+
+        df = yf.download(self.symbol, period=self.period, interval="1d",
+                         progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-        df.dropna(inplace=True)
-        
-        df['SMA_10'] = df['Close'].rolling(window=10).mean()
-        df['EMA_5'] = df['Close'].ewm(span=5, adjust=False).mean()
-        df['EMA_10'] = df['Close'].ewm(span=10, adjust=False).mean()
-        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
-        
-        df.to_csv(self.cache_file)
+            df.columns = [c[0] for c in df.columns]
+        df = df.dropna()
+        if not df.empty:
+            df.to_csv(self.cache_file)
         return df
 
-    def evaluate_market(self, force_refresh: bool = False):
-        df = self.fetch_data(force_refresh=force_refresh)
-        current_price = float(df['Close'].iloc[-1])
-        current_sma10 = float(df['SMA_10'].iloc[-1])
-        
-        if self.is_crypto:
-            pos_count = int(self.total_amount / self.pos_size_usd) if self.pos_size_usd > 0 else 0
+    def evaluate_market(
+        self,
+        force_refresh: bool = False,
+        benchmark_close: Optional[pd.Series] = None,
+        now: Optional[pd.Timestamp] = None,
+    ) -> MarketView:
+        raw = self.fetch_data(force_refresh=force_refresh)
+        if raw.empty:
+            raise ValueError(f"no price history available for {self.symbol}")
+
+        # Decide on completed bars only. The exit rule is defined on the close;
+        # evaluating it against a bar that is still printing makes the signal
+        # fire and unfire intraday.
+        closed = drop_forming_bar(raw, self.asset_class, now=now)
+        if closed.empty:
+            raise ValueError(f"{self.symbol}: no completed bars available")
+
+        frame = prepare(closed, self.params)
+        last = len(frame) - 1
+
+        if benchmark_close is not None:
+            gate = regime_mod.build_gate(benchmark_close, frame.index)
+            regime_ok = bool(gate.iloc[last])
         else:
-            pos_count = int(self.total_amount / self.stock_share_size) if self.stock_share_size > 0 else 0
+            regime_ok = True
 
-        total_pnl = 0.0
-        if self.total_amount > 0 and self.avg_price > 0:
-            if self.is_crypto:
-                total_pnl = ((current_price - self.avg_price) / self.avg_price) * self.total_amount
-            else:
-                total_pnl = (current_price - self.avg_price) * self.total_amount
-            
-        log_msgs = []
-        signal = "HOLD"
-        
-        # Calculate Resistance Levels FIRST so they can be returned even on a SELL signal
-        levels = estimate_sr_levels(df)
-        resistances = sorted([l for l in levels if l[2] == 'resistance'], key=lambda x: x[1])
-        nearest_broken_res = next((price for _, price, _, _ in reversed(resistances) if price < current_price), None)
-        next_overhead_res = next((price for _, price, _, _ in resistances if price > current_price), None)
-        
-        # Rule 1: Trailing Exit Condition (Close below 10 SMA)
-        if current_price < current_sma10:
-            if self.long_term:
-                log_msgs.append(f"⚠️ Price (${current_price:,.2f}) is below 10 SMA (${current_sma10:,.2f}). Holding due to LONG-TERM strategy flag.")
-            else:
-                log_msgs.append(f"🚨 EXIT SIGNAL: Current Price (${current_price:,.2f}) closed below 10 SMA (${current_sma10:,.2f}).")
-                if self.total_amount > 0:
-                    log_msgs.append("Action: LIQUIDATE ALL.")
-                    signal = "SELL"
-                # Return 7 values here
-                return df, current_price, current_sma10, total_pnl, signal, next_overhead_res, log_msgs
+        decision = evaluate(frame, last, self.position, regime_ok=regime_ok)
+        ann_vol = sizing_mod.annualized_vol_from_atr(decision.atr, decision.price)
+        target = sizing_mod.target_quantity(
+            self.equity, decision.price, ann_vol, self.asset_class, self.sizing_params
+        )
 
-        # Rule 2: Breakout Entry Condition
-        log_msgs.append("✅ Evaluating breakout levels...")
+        return MarketView(
+            symbol=self.symbol,
+            df=frame.df,
+            decision=decision,
+            position=self.position,
+            asset_class=self.asset_class,
+            unrealized_pnl=self.position.unrealized_pnl(decision.price),
+            ann_vol=ann_vol,
+            target_quantity=target,
+            regime_ok=regime_ok,
+        )
 
-        if next_overhead_res: log_msgs.append(f"🎯 Target Overhead Resistance: ${next_overhead_res:,.2f}")
 
-        if nearest_broken_res:
-            pct_above_breakout = (current_price - nearest_broken_res) / nearest_broken_res
-            if 0 < pct_above_breakout < 0.02:
-                log_msgs.append(f"💡 FRESH BREAKOUT: Price is {pct_above_breakout*100:.2f}% above resistance (${nearest_broken_res:,.2f}).")
-                if pos_count < self.max_pos:
-                    if self.is_crypto:
-                        log_msgs.append(f"🚀 BUY SIGNAL: Triggering entry for ${self.pos_size_usd:,.2f} USD @ ${current_price:,.2f}.")
-                    else:
-                        log_msgs.append(f"🚀 BUY SIGNAL: Triggering entry for {self.stock_share_size} shares @ ${current_price:,.2f}.")
-                    signal = "BUY"
-                else:
-                    log_msgs.append(f"⚠️ CAP REACHED: Max limit of {self.max_pos} positions active.")
-            else:
-                log_msgs.append(f"⏳ Holding. Current price maintains buffer above resistance (${nearest_broken_res:,.2f}).")
-
-        # Return 7 values here
-        return df, current_price, current_sma10, total_pnl, signal, next_overhead_res, log_msgs
+# Re-exported so existing imports keep resolving.
+__all__ = ["SwingBreakoutMonitor", "MarketView", "Action", "Position", "CACHE_TTL_SECONDS"]
