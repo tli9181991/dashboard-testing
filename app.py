@@ -20,6 +20,7 @@ from strategy import StrategyParams, add_indicators
 from chat_history import ChatHistoryStore, make_message
 from watchlist import WatchlistStore
 import swing_screener as swing
+import swing_charts as swing_charts
 from strategy import AssetClass, Position
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
@@ -83,14 +84,20 @@ def run_swing_scan(tickers: tuple, overrides: tuple, use_demo: bool, demo_size: 
         sector_data = swing.load_yfinance(swing.SECTOR_ETFS)
 
     if "SPY" not in bars:
-        return None, {"stage": "no SPY series — the regime layer needs one"}, cfg
+        return None, {"stage": "no SPY series — the regime layer needs one"}, cfg, {}
 
     spy = bars.pop("SPY")
     if not bars:
-        return None, {"stage": "no symbols survived loading"}, cfg
+        return None, {"stage": "no symbols survived loading"}, cfg, {}
 
     out, ctx = swing.run_scan(bars, spy, cfg, sector_data=sector_data)
-    return out, ctx, cfg
+
+    # Keep the bars behind each candidate so the trade-plan charts do not have to
+    # fetch the same history again. Trimmed, since only the recent window is drawn.
+    candidate_bars = {}
+    if out is not None and not out.empty:
+        candidate_bars = {t: bars[t].tail(260) for t in out["ticker"].unique() if t in bars}
+    return out, ctx, cfg, candidate_bars
 
 
 def render_price_chart(ticker: str, df: pd.DataFrame, height: int = 360):
@@ -494,11 +501,13 @@ if SHOW_TAB_SWING:
 
             with st.spinner("Running the funnel..."):
                 try:
-                    swing_out, swing_ctx, swing_cfg = run_swing_scan(
+                    swing_out, swing_ctx, swing_cfg, swing_bars = run_swing_scan(
                         swing_tickers, overrides, use_demo, int(demo_size)
                     )
                 except Exception as exc:
-                    swing_out, swing_ctx, swing_cfg = None, {"stage": f"scan failed: {exc}"}, {}
+                    swing_out, swing_ctx, swing_cfg, swing_bars = (
+                        None, {"stage": f"scan failed: {exc}"}, {}, {}
+                    )
 
             if swing_out is None:
                 st.error(f"⚠️ {swing_ctx.get('stage', 'scan produced nothing')}")
@@ -511,12 +520,9 @@ if SHOW_TAB_SWING:
                 r3.metric("Breadth", f"{breadth:.0%}" if breadth == breadth else "—")
                 r4.metric("Slots", swing_ctx.get("slots", 0))
 
-                st.markdown(
-                    f"**Funnel** — {swing_ctx.get('universe', 0)} universe → "
-                    f"{swing_ctx.get('gated', 0)} liquidity gate → "
-                    f"{swing_ctx.get('floor_ok', 0)} tradability floor → "
-                    f"{swing_ctx.get('tradable', 0)} tradable → "
-                    f"**{len(swing_out)} with a setup**"
+                st.plotly_chart(
+                    swing_charts.build_funnel(swing_ctx, len(swing_out)),
+                    width="stretch", key="swing_funnel",
                 )
 
                 if regime == "risk_off":
@@ -532,9 +538,26 @@ if SHOW_TAB_SWING:
                     shown["close"] = shown["close"].round(2)
                     st.dataframe(shown, width="stretch", hide_index=True)
 
+                    st.plotly_chart(
+                        swing_charts.build_score_breakdown(swing_out, swing_cfg),
+                        width="stretch", key="swing_scores",
+                    )
+                    st.caption(
+                        "Components are z-scores across today's candidates, so they are "
+                        "relative to this scan only — a negative bar means below average "
+                        "here, not bad in absolute terms."
+                    )
+
+                    # A scatter of one or two points is a stat tile, not a chart.
+                    if len(swing_out) >= 3:
+                        st.plotly_chart(
+                            swing_charts.build_risk_reward(swing_out),
+                            width="stretch", key="swing_risk_reward",
+                        )
+
                     slots = int(swing_ctx.get("slots", 0)) or len(swing_out)
                     st.markdown(f"#### Book — top {min(slots, len(swing_out))} by composite score")
-                    for _, cand in swing_out.head(slots).iterrows():
+                    for rank, (_, cand) in enumerate(swing_out.head(slots).iterrows()):
                         ticker = str(cand["ticker"])
                         risk_per_share = float(cand["entry"]) - float(cand["stop"])
                         with st.container(border=True):
@@ -561,6 +584,17 @@ if SHOW_TAB_SWING:
                                                             source="swing_screener")
                                         st.toast(f"Added {ticker} to the watchlist.")
                                         st.rerun()
+
+                            plan_bars = swing_bars.get(ticker)
+                            if plan_bars is None or plan_bars.empty:
+                                st.caption("No price history retained for the chart.")
+                            else:
+                                with st.expander(f"{ticker} trade plan chart",
+                                                 expanded=(rank == 0)):
+                                    st.plotly_chart(
+                                        swing_charts.build_trade_plan(ticker, plan_bars, cand),
+                                        width="stretch", key=f"swing_plan_{ticker}_{rank}",
+                                    )
 
                     st.download_button(
                         "⬇️ Download candidates as CSV",
