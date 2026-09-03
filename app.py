@@ -15,6 +15,7 @@ import data as data_mod
 from breakout import SwingBreakoutMonitor
 from positions import load_portfolio, conversion_notes
 from sizing import SizingParams
+from strategy import StrategyParams, add_indicators
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
@@ -22,19 +23,68 @@ from chat_agent import get_financial_agent
 # =============================================================================
 # Helper Functions
 # =============================================================================
+# EMAs for the screener charts come from the same helper the strategy uses, so a
+# line on a chart always means what the signal engine means by it.
+SCREENER_CHART_PARAMS = StrategyParams(ema_spans=(5, 10, 20))
+SCREENER_EMA_STYLE = {
+    "EMA_5": ("5 EMA", "#00F0FF", 1),
+    "EMA_10": ("10 EMA", "#FF00FF", 1),
+    "EMA_20": ("20 EMA", "#00FF00", 1.5),
+}
+
+
 @st.cache_data(ttl=3600)
-def fetch_normalized_sector_prices(tickers: list) -> pd.DataFrame:
-    if not tickers: return pd.DataFrame()
-    hist = yf.download(tickers, period="6mo", interval="1d", progress=False)
-    
-    if isinstance(hist.columns, pd.MultiIndex):
-        closes = hist["Close"]
-    else:
-        closes = pd.DataFrame({tickers[0]: hist["Close"]})
-    
-    closes.dropna(inplace=True)
-    if closes.empty: return pd.DataFrame()
-    return (closes / closes.iloc[0] - 1) * 100
+def fetch_sector_price_history(tickers: tuple, period: str = "6mo") -> dict:
+    """Per-ticker OHLCV with EMA overlays, keyed by symbol.
+
+    Prices are left in their own units — each stock gets its own axis, so there is
+    nothing to normalise against.
+    """
+    if not tickers:
+        return {}
+
+    raw = yf.download(list(tickers), period=period, interval="1d", progress=False,
+                      group_by="ticker", auto_adjust=True)
+    if raw is None or raw.empty:
+        return {}
+
+    out = {}
+    for ticker in tickers:
+        try:
+            sub = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
+            sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if sub.empty:
+                continue
+            out[ticker] = add_indicators(sub, SCREENER_CHART_PARAMS)
+        except Exception:
+            continue
+    return out
+
+
+def render_price_chart(ticker: str, df: pd.DataFrame, height: int = 360):
+    """Candlestick with 5/10/20 EMA overlays, on the stock's own price scale."""
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name=ticker, showlegend=False,
+    ))
+    for column, (label, colour, width) in SCREENER_EMA_STYLE.items():
+        if column in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[column], mode="lines", name=label,
+                line=dict(color=colour, width=width),
+            ))
+
+    last_close = float(df["Close"].iloc[-1])
+    fig.update_layout(
+        title=f"{ticker} — ${last_close:,.2f}",
+        template="plotly_dark", height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0),
+        xaxis=dict(rangeslider=dict(visible=False), type="date"),
+        yaxis=dict(title="Price ($)"),
+    )
+    return fig
 
 # =============================================================================
 # Dashboard Initialization
@@ -185,8 +235,7 @@ if SHOW_TAB_BREAKOUT:
                     rangeslider=dict(visible=False), type="date"
                 )
             )
-            # st.plotly_chart correctly uses use_container_width
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
         with col2:
             st.subheader(f"Execution Stream: {chart_ticker}")
@@ -224,19 +273,23 @@ if SHOW_TAB_SCREENER:
                 
                 tickers = sector_df["ticker"].tolist()
                 if tickers:
-                    with st.expander(f"View {sector_name} Relative Performance Chart (6 Months)"):
-                        sec_prices = fetch_normalized_sector_prices(tickers)
-                        if not sec_prices.empty:
-                            fig_sec = go.Figure()
-                            for t in tickers:
-                                if t in sec_prices.columns:
-                                    fig_sec.add_trace(go.Scatter(x=sec_prices.index, y=sec_prices[t], mode='lines', name=t))
-                            fig_sec.update_layout(
-                                title=f"{sector_name} Top 5 - 6 Month Relative Return (%)",
-                                template="plotly_dark", height=400,
-                                xaxis_title="Date", yaxis_title="Performance (%)"
-                            )
-                            st.plotly_chart(fig_sec, use_container_width=True)
+                    with st.expander(f"View {sector_name} Price Charts (6 Months, 5/10/20 EMA)"):
+                        history = fetch_sector_price_history(tuple(tickers))
+                        if not history:
+                            st.caption("No price data available for this sector right now.")
+                        else:
+                            chart_cols = st.columns(2)
+                            for n, ticker in enumerate(tickers):
+                                with chart_cols[n % 2]:
+                                    frame = history.get(ticker)
+                                    if frame is None or frame.empty:
+                                        st.caption(f"No price data for {ticker}.")
+                                        continue
+                                    st.plotly_chart(
+                                        render_price_chart(ticker, frame),
+                                        width="stretch",
+                                        key=f"screener_{sector_name}_{ticker}",
+                                    )
                 st.markdown("---")
             
         if st.button("Run Fresh Full Stock Rescan (Warning: Takes ~3-5 mins)"):
