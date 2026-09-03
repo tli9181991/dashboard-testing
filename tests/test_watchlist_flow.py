@@ -114,3 +114,35 @@ def test_button_state_reflects_membership(store):
     store.add("NVDA")
     watched = set(store.symbols())
     assert "NVDA" in watched                        # -> "watching (click to remove)"
+
+
+def test_removing_one_symbol_leaves_the_others_in_order(store):
+    """Each watchlist row gets its own remove button; one click removes one name."""
+    for symbol in ("NVDA", "TSM", "AMD", "MRVL"):
+        store.add(symbol)
+
+    assert store.remove("TSM") is True
+    assert store.symbols() == ["NVDA", "AMD", "MRVL"]
+
+    assert store.remove("MRVL") is True
+    assert store.symbols() == ["NVDA", "AMD"]
+
+
+def test_remove_button_keys_are_unique_per_symbol(store):
+    """The button key is derived from the ticker, so it must be collision-free."""
+    for symbol in ("NVDA", "TSM", "AMD"):
+        store.add(symbol)
+    keys = [f"wl_remove_{s}" for s in store.symbols()]
+    assert len(set(keys)) == len(keys)
+
+
+def test_removing_a_sold_name_stops_it_being_monitored(store):
+    """The stated use case: a position was closed, drop it from the watchlist."""
+    store.add("NVDA")
+    store.add("TSM")
+    assert set(_build_monitored({}, store)) == {"NVDA", "TSM"}
+
+    store.remove("NVDA")
+    monitored = _build_monitored({}, store)
+    assert "NVDA" not in monitored
+    assert set(monitored) == {"TSM"}

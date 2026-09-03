@@ -251,16 +251,17 @@ if SHOW_TAB_BREAKOUT:
                 "Watchlist names are evaluated with no position, so BUY marks a fresh "
                 "entry signal. They carry no PnL until you add them to `portfolio.csv`."
             )
-            with st.expander("Manage watchlist"):
-                # Deliberately unkeyed: after a removal the options shrink, and a
-                # keyed widget would still be holding symbols that no longer exist.
-                to_drop = st.multiselect(
-                    "Remove symbols", [row["Ticker"] for row in watchlist_rows]
-                )
-                if st.button("Remove selected", disabled=not to_drop):
-                    removed = watchlist_store.remove_many(to_drop)
-                    st.toast(f"Removed {removed} symbol(s) from the watchlist.")
-                    st.rerun()
+            st.caption("Remove from watchlist:")
+            remove_cols = st.columns(min(len(watchlist_rows), 6))
+            for n, row in enumerate(watchlist_rows):
+                watched_ticker = row["Ticker"]
+                with remove_cols[n % len(remove_cols)]:
+                    if st.button(f"✕ {watched_ticker}", key=f"wl_remove_{watched_ticker}",
+                                 width="stretch",
+                                 help=f"Stop watching {watched_ticker}"):
+                        watchlist_store.remove(watched_ticker)
+                        st.toast(f"Removed {watched_ticker} from the watchlist.")
+                        st.rerun()
         else:
             st.caption("Empty. Pick stocks from the 🔍 Screener tab to start watching them.")
 
