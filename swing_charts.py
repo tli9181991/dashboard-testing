@@ -27,26 +27,22 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-# ── Surface & ink ────────────────────────────────────────────────────────────
-SURFACE = "#1a1a19"
-INK_PRIMARY = "#ffffff"
-INK_SECONDARY = "#c3c2b7"
-INK_MUTED = "#898781"
-GRID = "#2c2c2a"
-AXIS = "#383835"
-
-# ── Status (reserved; never used for a series) ───────────────────────────────
-STATUS_GOOD = "#0ca30c"
-STATUS_CRITICAL = "#d03b3b"
-
-# ── Categorical slots, fixed order (dark steps) ──────────────────────────────
-CATEGORICAL = ["#3987e5", "#d95926", "#199e70", "#c98500"]
-
-# ── Ordinal blue ramps, light → dark ─────────────────────────────────────────
-RAMP_MA = ["#9ec5f4", "#5598e7", "#256abf"]
-RAMP_FUNNEL = ["#b7d3f6", "#86b6ef", "#5598e7", "#2a78d6", "#1c5cab"]
-
-FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
+# The theme lives in viz.py so every chart in the app shares one definition.
+# Re-exported here because this module's own API already exposes these names.
+from viz import (  # noqa: E402  (kept beside the other module-level constants)
+    AXIS,
+    CATEGORICAL,
+    FONT,
+    GRID,
+    INK_MUTED,
+    INK_PRIMARY,
+    INK_SECONDARY,
+    RAMP_FUNNEL,
+    RAMP_MA,
+    STATUS_CRITICAL,
+    STATUS_GOOD,
+    SURFACE,
+)
 
 
 def _base_layout(fig: go.Figure, height: int, title: str = "") -> go.Figure:

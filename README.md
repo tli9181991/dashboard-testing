@@ -120,6 +120,27 @@ The causality contract is proved empirically in `tests/test_causality.py`: appen
 future bars must never change a decision already taken. If those tests fail, every
 number this repo produces is fiction.
 
+## 🎲 Simulation
+
+A single historical replay gives one number, and that number mixes the strategy,
+the order the trades happened to arrive in, and the stretch of history it ran
+through. `simulation.py` separates them:
+
+- **Bootstrap** — resamples the realised trades thousands of times and rebuilds the
+  equity curve, so you see the range of outcomes the same trades could have given.
+  A realised path near the edge of the fan owed much of its result to sequence luck.
+- **Random-entry benchmark** — replays the same number of trades with the same
+  holding periods but random entry dates in the same names. If the strategy's
+  average trade does not clear that distribution, the entry rule added nothing over
+  simply being in the market that long. This is the sharpest of the three tests.
+- **Buy and hold** — the honest floor. A strategy that only beats it by sitting in
+  cash through a drawdown has not demonstrated selection skill.
+
+The screener tab runs all three over the screened stocks. **Read the comparisons,
+not the absolute return**: names selected today for having trended are not a fair
+sample of what you could have picked back then, so absolute results from such a run
+are inflated. The comparisons survive because every leg inherits the same bias.
+
 ## 🛡️ Risk Controls
 
 **Volatility-targeted sizing** replaces the old fixed six-share position:

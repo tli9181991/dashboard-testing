@@ -21,6 +21,9 @@ from chat_history import ChatHistoryStore, make_message
 from watchlist import WatchlistStore
 import swing_screener as swing
 import swing_charts as swing_charts
+import backtest_charts
+import simulation as sim
+from backtest import BacktestConfig, CostModel, run_backtest
 from strategy import AssetClass, Position
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
@@ -65,6 +68,62 @@ def fetch_sector_price_history(tickers: tuple, period: str = "6mo") -> dict:
         except Exception:
             continue
     return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_backtest_history(tickers: tuple, period: str = "5y") -> dict:
+    """Raw OHLCV for the backtester. Longer than the chart window, and left
+    un-annotated because ``strategy.prepare`` adds its own indicators."""
+    if not tickers:
+        return {}
+    raw = yf.download(list(tickers), period=period, interval="1d", progress=False,
+                      group_by="ticker", auto_adjust=True)
+    if raw is None or raw.empty:
+        return {}
+
+    out = {}
+    for ticker in tickers:
+        try:
+            sub = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
+            sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if len(sub) > 250:
+                out[ticker] = sub
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_screener_backtest(tickers: tuple, period: str, equity: float, target_vol: float,
+                          max_position_pct: float, use_regime: bool,
+                          slippage_bps: float, commission_bps: float, n_paths: int):
+    """Backtest the breakout strategy over the screened names, then simulate.
+
+    Returns (result, report, price_data) or (None, reason, {}).
+    """
+    price_data = fetch_backtest_history(tickers, period=period)
+    if not price_data:
+        return None, "No price history could be loaded for these tickers.", {}
+
+    benchmark = None
+    if use_regime:
+        bench = data_mod.load_history(REGIME_BENCHMARK, period=period)
+        if not bench.empty:
+            benchmark = bench["Close"]
+
+    config = BacktestConfig(
+        initial_equity=equity,
+        use_regime_gate=use_regime and benchmark is not None,
+        sizing=SizingParams(target_vol=target_vol, max_position_pct=max_position_pct),
+        costs=CostModel(slippage_bps=slippage_bps, commission_bps=commission_bps),
+    )
+    try:
+        result = run_backtest(price_data, benchmark, config)
+    except Exception as exc:
+        return None, f"Backtest failed: {exc}", {}
+
+    report = sim.summarise(result, price_data, sim.SimulationParams(n_paths=int(n_paths)))
+    return result, report, price_data
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -418,6 +477,155 @@ if SHOW_TAB_SCREENER:
                                     )
                 st.markdown("---")
             
+        # ── Strategy backtest over the screened names ───────────────────────
+        st.markdown("---")
+        st.subheader("📉 Strategy backtest on the screened stocks")
+
+        all_screened = sorted(cached_top5["ticker"].unique()) if not cached_top5.empty else []
+        if not all_screened:
+            st.caption("Run a screen first — there is nothing to backtest yet.")
+        else:
+            st.warning(
+                "**These results are selection-biased and are not an edge estimate.** "
+                "These stocks were picked *today* for already having trended, so a "
+                "strategy replayed over their history is being handed names that are "
+                "known to have gone up. Read the comparisons below, not the absolute "
+                "return: the strategy, buy-and-hold and the random-entry benchmark all "
+                "inherit the same bias, so the differences between them still mean "
+                "something."
+            )
+
+            b1, b2, b3 = st.columns([2, 1, 1])
+            with b1:
+                sectors_available = sorted(s for s in cached_top5["sector"].unique() if s != "Unknown")
+                scope = st.selectbox(
+                    "Scope", ["All screened stocks"] + [f"Sector: {s}" for s in sectors_available],
+                    key="bt_scope",
+                )
+            with b2:
+                bt_period = st.selectbox("History", ["2y", "3y", "5y", "10y"], index=2, key="bt_period")
+            with b3:
+                bt_paths = st.select_slider("Simulated paths", [200, 500, 1000, 2000, 5000],
+                                            value=1000, key="bt_paths")
+
+            with st.expander("Cost and risk assumptions"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    bt_slippage = st.slider("Slippage (bps, one way)", 0.0, 50.0, 5.0, 1.0,
+                                            help="Applied adversely to every fill. Breakout "
+                                                 "entries are where real fills are worst.")
+                with c2:
+                    bt_commission = st.slider("Commission (bps of notional)", 0.0, 20.0, 1.0, 0.5)
+                with c3:
+                    bt_regime = st.checkbox("Apply the regime gate", value=True, key="bt_regime")
+
+            if scope.startswith("Sector: "):
+                wanted = scope.removeprefix("Sector: ")
+                bt_tickers = tuple(sorted(
+                    cached_top5.loc[cached_top5["sector"] == wanted, "ticker"].unique()))
+            else:
+                bt_tickers = tuple(all_screened)
+
+            st.caption(f"{len(bt_tickers)} symbols: {', '.join(bt_tickers)}")
+
+            if st.button("▶️ Run backtest", type="primary", key="bt_run"):
+                run_screener_backtest.clear()
+
+            with st.spinner(f"Replaying {len(bt_tickers)} symbols and simulating..."):
+                bt_result, bt_report, bt_prices = run_screener_backtest(
+                    bt_tickers, bt_period, float(account_equity), float(target_vol),
+                    float(max_position_pct), bool(bt_regime), float(bt_slippage),
+                    float(bt_commission), int(bt_paths),
+                )
+
+            if bt_result is None:
+                st.error(f"⚠️ {bt_report}")
+            elif bt_result.trades.empty:
+                st.info("The strategy took no trades over this window — nothing to simulate.")
+                st.dataframe(pd.DataFrame([bt_result.metrics]), width="stretch", hide_index=True)
+            else:
+                metrics = bt_result.metrics
+                buy_hold = bt_report["buy_and_hold"]
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Strategy return", f"{metrics['total_return']:.1%}")
+                k2.metric("Buy & hold", f"{buy_hold.get('total_return', 0):.1%}",
+                          delta=f"{metrics['total_return'] - buy_hold.get('total_return', 0):.1%}")
+                k3.metric("Sharpe", f"{metrics['sharpe']:.2f}")
+                k4.metric("Max drawdown", f"{metrics['max_drawdown']:.1%}")
+
+                k5, k6, k7, k8 = st.columns(4)
+                k5.metric("Trades", metrics["n_trades"])
+                k6.metric("Win rate", f"{metrics['win_rate']:.0%}")
+                k7.metric("Profit factor", f"{metrics['profit_factor']:.2f}")
+                k8.metric("Time in market", f"{metrics['exposure']:.0%}")
+
+                st.plotly_chart(
+                    backtest_charts.build_equity_comparison(bt_result, buy_hold),
+                    width="stretch", key="bt_equity",
+                )
+                st.caption(
+                    "The strategy sits flat whenever it is out of the market, so beating "
+                    "buy-and-hold through a drawdown may reflect being in cash rather "
+                    "than picking well. The next chart tests the entries themselves."
+                )
+
+                random_entry = bt_report.get("random_entry")
+                if random_entry:
+                    st.plotly_chart(
+                        backtest_charts.build_random_entry_distribution(random_entry),
+                        width="stretch", key="bt_random",
+                    )
+                    pct = random_entry["percentile"]
+                    if pct >= 90:
+                        st.success(
+                            f"The average trade beat {pct:.0f}% of random entries holding "
+                            "for the same lengths — the entry rule is doing work."
+                        )
+                    elif pct >= 60:
+                        st.info(
+                            f"The average trade beat {pct:.0f}% of random entries. Weak "
+                            "evidence the signal adds something beyond exposure."
+                        )
+                    else:
+                        st.warning(
+                            f"The average trade beat only {pct:.0f}% of random entries of "
+                            "the same length. On this data the entry rule is not "
+                            "outperforming simply being in the market that long."
+                        )
+
+                bootstrap = bt_report.get("bootstrap")
+                if bootstrap is not None:
+                    st.plotly_chart(
+                        backtest_charts.build_bootstrap_fan(bootstrap, bt_result.trades["return_pct"]),
+                        width="stretch", key="bt_fan",
+                    )
+                    s = bt_report["bootstrap_summary"]
+                    st.caption(
+                        f"Resampling the trade order {s['n_paths']:,} times: median outcome "
+                        f"{s['median_return']:+.1%}, 5th–95th percentile "
+                        f"{s['p05_return']:+.1%} to {s['p95_return']:+.1%}, "
+                        f"{s['prob_profit']:.0%} of orderings finish profitable, median worst "
+                        f"drawdown {s['median_max_drawdown']:.1%}. A realised path near the "
+                        "edge of the fan owes much of its result to the order the trades "
+                        "happened to arrive in. This compounds per-trade returns at a "
+                        "constant stake, so it does not match the equity curve above."
+                    )
+
+                st.plotly_chart(
+                    backtest_charts.build_per_symbol_returns(bt_result, buy_hold),
+                    width="stretch", key="bt_persym",
+                )
+
+                with st.expander(f"Trade log ({len(bt_result.trades)})"):
+                    st.dataframe(bt_result.trades, width="stretch", hide_index=True)
+                    st.download_button(
+                        "⬇️ Download trades as CSV",
+                        bt_result.trades.to_csv(index=False).encode("utf-8"),
+                        file_name="screener_backtest_trades.csv", mime="text/csv",
+                    )
+
+        st.markdown("---")
         if st.button("Run Fresh Full Stock Rescan (Warning: Takes ~3-5 mins)"):
             with st.spinner("Scraping S&P 500 and executing fresh screening..."):
                 get_or_create_sector_stocks(force_rescan=True)
