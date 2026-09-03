@@ -39,6 +39,9 @@ REGIME_BENCHMARK = os.getenv("REGIME_BENCHMARK", "^GSPC")
 CACHE_DIR = Path("./.screen_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Assistant conversations are stored here, one JSON file each (see chat_history.py).
+CHAT_HISTORY_DIR = Path(os.getenv("CHAT_HISTORY_DIR", "./.chat_history"))
+
 LOCAL_TOP5_SECTOR_FILE = CACHE_DIR / "top5_stocks_by_sector.csv"
 LOCAL_SCREENING_RAW_FILE = CACHE_DIR / "raw_screening_results.csv"
 

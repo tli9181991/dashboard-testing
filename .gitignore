@@ -4,3 +4,4 @@
 .screen_cache
 __pycache__
 setting.json
+.chat_history

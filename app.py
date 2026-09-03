@@ -9,13 +9,15 @@ from datetime import datetime
 from config import (
     ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
     USE_REGIME_GATE, REGIME_BENCHMARK,
-    SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT
+    SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT,
+    CHAT_HISTORY_DIR
 )
 import data as data_mod
 from breakout import SwingBreakoutMonitor
 from positions import load_portfolio, conversion_notes
 from sizing import SizingParams
 from strategy import StrategyParams, add_indicators
+from chat_history import ChatHistoryStore, make_message
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
@@ -320,69 +322,99 @@ if SHOW_TAB_SENTIMENT:
 # TAB 4: LangChain AI Financial Assistant
 if SHOW_TAB_CHATBOT:
     with rendered_tabs[tab_index]:
+        chat_store = ChatHistoryStore(CHAT_HISTORY_DIR)
+
+        def _open_conversation(conversation):
+            """Point session state — and the picker widget — at one conversation."""
+            st.session_state.conversation_id = conversation.id
+            st.session_state.messages = conversation.messages
+            # A keyed widget's stored value wins over its `index` argument, so the
+            # picker has to be moved explicitly or it snaps back to the old thread.
+            st.session_state.conversation_picker = conversation.id
+
+        # Reopen whatever conversation was last in use. session_state is in-memory
+        # only, so without this every restart started from a blank thread.
+        if "conversation_id" not in st.session_state:
+            _open_conversation(chat_store.load_current_or_create())
+
         c1, c2 = st.columns([8, 2])
         with c1:
             st.subheader("💬 AI Financial Assistant")
             st.markdown("Ask me to analyze stocks, search the news, or give suggestions based on technicals!")
         with c2:
-            if st.button("🗑️ Clear Memory"):
-                st.session_state.messages = []
-                st.session_state.chat_history = []
+            if st.button("🗑️ Clear Chat History", width="stretch"):
+                # Archive the current thread and open a fresh one. Nothing is
+                # deleted — the old conversation stays on disk and in the picker.
+                current = chat_store.load(st.session_state.conversation_id)
+                _open_conversation(chat_store.start_new(current))
                 st.rerun()
-        
-        # Initialize UI Chat History
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-            
-        # Initialize LangChain Memory State
-        if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
 
-        # Render UI Chat History
+        conversations = chat_store.list_conversations()
+        if len(conversations) > 1:
+            ids = [c.id for c in conversations]
+            labels = {c.id: c.label() for c in conversations}
+            try:
+                position = ids.index(st.session_state.conversation_id)
+            except ValueError:
+                position = 0
+            chosen = st.selectbox(
+                "Conversation", ids, index=position,
+                format_func=lambda i: labels.get(i, i), key="conversation_picker",
+            )
+            if chosen != st.session_state.conversation_id:
+                selected = chat_store.load(chosen)
+                if selected is not None:
+                    chat_store.set_current(selected.id)
+                    _open_conversation(selected)
+                    st.rerun()
+
+        st.caption(f"{len(st.session_state.messages)} messages · saved to `{CHAT_HISTORY_DIR}`")
+
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        # Chat Input logic
         if prompt := st.chat_input("E.g., 'What is the latest news on NVDA and should I buy it?'"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            # The agent needs the exchanges *before* this prompt, so capture the
+            # history first and append afterwards.
+            prior = list(st.session_state.messages)
+            st.session_state.messages.append(make_message("user", prompt))
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
                 with st.spinner("Agent is researching and thinking..."):
-                    # FIXED: Called with NO arguments.
-                    agent = get_financial_agent() 
+                    agent = get_financial_agent()
                     if not agent:
                         response = "⚠️ Please ensure AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL are configured in your .env file."
                     else:
                         try:
                             from langchain_core.messages import HumanMessage, AIMessage
-                            
-                            # Format memory for LangChain
-                            formatted_history = []
-                            for msg in st.session_state.chat_history:
-                                if msg["role"] == "user":
-                                    formatted_history.append(HumanMessage(content=msg["content"]))
-                                else:
-                                    formatted_history.append(AIMessage(content=msg["content"]))
 
+                            formatted_history = [
+                                HumanMessage(content=m["content"]) if m["role"] == "user"
+                                else AIMessage(content=m["content"])
+                                for m in prior
+                            ]
                             result = agent.invoke({
                                 "input": prompt,
-                                "chat_history": formatted_history
+                                "chat_history": formatted_history,
                             })
                             response = result["output"]
                         except Exception as e:
                             response = f"Agent encountered an error: {str(e)}"
-                    
+
                     st.markdown(response)
-            
-            # Save to UI memory
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            
-            # Save to LangChain memory
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+            st.session_state.messages.append(make_message("assistant", response))
+
+            # Persist immediately so a crash or restart cannot lose the exchange.
+            conversation = chat_store.load(st.session_state.conversation_id)
+            if conversation is None:
+                conversation = chat_store.create()
+                st.session_state.conversation_id = conversation.id
+            conversation.messages = st.session_state.messages
+            chat_store.save(conversation)
 
 if not auto_refresh_paused:
     time.sleep(refresh_rate)
