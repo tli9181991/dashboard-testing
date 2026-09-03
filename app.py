@@ -538,15 +538,24 @@ if SHOW_TAB_SWING:
                     shown["close"] = shown["close"].round(2)
                     st.dataframe(shown, width="stretch", hide_index=True)
 
-                    st.plotly_chart(
-                        swing_charts.build_score_breakdown(swing_out, swing_cfg),
-                        width="stretch", key="swing_scores",
-                    )
-                    st.caption(
-                        "Components are z-scores across today's candidates, so they are "
-                        "relative to this scan only — a negative bar means below average "
-                        "here, not bad in absolute terms."
-                    )
+                    # The components are z-scores across the scan, so a single
+                    # candidate scores zero on every one of them by definition —
+                    # the chart would be blank rather than informative.
+                    if len(swing_out) >= 2:
+                        st.plotly_chart(
+                            swing_charts.build_score_breakdown(swing_out, swing_cfg),
+                            width="stretch", key="swing_scores",
+                        )
+                        st.caption(
+                            "Components are z-scores across today's candidates, so they are "
+                            "relative to this scan only — a negative bar means below average "
+                            "here, not bad in absolute terms."
+                        )
+                    else:
+                        st.caption(
+                            "Only one candidate today, so there is no cross-section to rank "
+                            "it against — the score breakdown needs at least two."
+                        )
 
                     # A scatter of one or two points is a stat tile, not a chart.
                     if len(swing_out) >= 3:

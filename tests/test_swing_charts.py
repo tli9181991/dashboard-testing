@@ -293,3 +293,17 @@ def test_crowded_scatters_still_plot_every_point():
     out = _synthetic_candidates(30)
     fig = charts.build_risk_reward(out)
     assert sum(len(trace.x) for trace in fig.data) == 30
+
+
+def test_a_lone_candidate_has_no_cross_section_to_score_against(scan):
+    """Why app.py guards the breakdown: z-scores over one row are all zero.
+
+    Rendering it anyway produces an axis with nothing on it, which reads as a
+    broken chart rather than as "there is only one candidate".
+    """
+    out, _, cfg, _ = scan
+    single = out.head(1)
+    components = charts.score_components(single, cfg)
+    assert len(components) == 1
+    assert (components.iloc[0].abs() < 1e-9).all(), \
+        "a single candidate should contribute nothing on any component"
