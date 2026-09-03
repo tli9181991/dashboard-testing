@@ -11,7 +11,10 @@ def parse_bool(val: str, default: bool) -> bool:
     return str(val).lower() in ("true", "1", "yes", "y", "t")
 
 # API Keys & Defaults
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+AZURE_INFERENCE_ENDPOINT = os.getenv("AZURE_INFERENCE_ENDPOINT", "")
+AZURE_INFERENCE_CREDENTIAL = os.getenv("AZURE_INFERENCE_CREDENTIAL", "")
+DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "DeepSeek-V4-Flash")
 INITIAL_ETH_PRICE = float(os.getenv("INITIAL_ETH_PRICE", "2300.0"))
 DEFAULT_POS_SIZE_USD = float(os.getenv("POS_SIZE_USD", "500.0"))
 DEFAULT_MAX_POS = int(os.getenv("MAX_POS", "5"))

@@ -20,9 +20,11 @@ pytz
 # AI features
 langchain
 langchain-community
-langchain-google-genai
+# langchain-google-genai
+langchain-azure-openai
 duckduckgo-search
 pydantic
+ddgs
 
 # Tests
 pytest>=7.0

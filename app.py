@@ -7,7 +7,7 @@ import yfinance as yf
 from datetime import datetime
 
 from config import (
-    GOOGLE_API_KEY, ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
+    ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
     USE_REGIME_GATE, REGIME_BENCHMARK,
     SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT
 )
@@ -251,9 +251,9 @@ if SHOW_TAB_SENTIMENT:
         sentiment_ticker = st.selectbox("Select Portfolio Asset for AI Analysis:", portfolio_tickers, key="sentiment_box")
         st.subheader(f"AI News Synthesis ({sentiment_ticker})")
         
-        # Passes the environment API key securely without the UI input
-        sentiment_payload = get_hourly_sentiment(sentiment_ticker, os.environ.get("GOOGLE_API_KEY", ""))
-        
+        # Auth is read from AZURE_INFERENCE_ENDPOINT / AZURE_INFERENCE_CREDENTIAL in config.py
+        sentiment_payload = get_hourly_sentiment(sentiment_ticker)
+                
         if "error" in sentiment_payload:
             st.warning(sentiment_payload["error"])
         else:
@@ -301,7 +301,7 @@ if SHOW_TAB_CHATBOT:
                     # FIXED: Called with NO arguments.
                     agent = get_financial_agent() 
                     if not agent:
-                        response = "⚠️ Please ensure GOOGLE_API_KEY is configured in your .env file."
+                        response = "⚠️ Please ensure AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL are configured in your .env file."
                     else:
                         try:
                             from langchain_core.messages import HumanMessage, AIMessage

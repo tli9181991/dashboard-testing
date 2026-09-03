@@ -3,9 +3,7 @@ import time
 import pytz
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-from config import GOOGLE_API_KEY
 from screening import load_sp500_symbols, run_screening, get_top5_per_sector
-from sentiment import analyze_sector_with_gemini
 
 def run_daily_sector_pipeline():
     print(f"\n🚀 Running Daily Pipeline: {datetime.now(pytz.timezone('Asia/Hong_Kong')).strftime('%Y-%m-%d %H:%M:%S HKT')}")

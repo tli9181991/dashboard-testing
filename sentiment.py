@@ -5,7 +5,9 @@ import yfinance as yf
 from datetime import datetime, timezone
 from typing import Literal
 from pydantic import BaseModel, Field
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
+
+from config import AZURE_INFERENCE_ENDPOINT, AZURE_INFERENCE_CREDENTIAL, DEEPSEEK_MODEL_NAME
 
 class NewsItem(BaseModel):
     ticker: str
@@ -31,10 +33,10 @@ class SectorAnalysisResult(BaseModel):
 
 SENTIMENT_SYSTEM = "You are a financial-news classification AI. Classify the news. Return structured JSON."
 
-def get_hourly_sentiment(ticker: str, api_key: str) -> dict:
-    if not api_key: return {"error": "Missing Gemini API Key."}
-    os.environ["GOOGLE_API_KEY"] = api_key
-    
+def get_hourly_sentiment(ticker: str) -> dict:
+    if not AZURE_INFERENCE_ENDPOINT or not AZURE_INFERENCE_CREDENTIAL:
+        return {"error": "Missing Azure AI Foundry endpoint/credential (AZURE_INFERENCE_ENDPOINT / AZURE_INFERENCE_CREDENTIAL)."}
+
     try: raw_items = yf.Ticker(ticker).news or []
     except Exception: raw_items = []
         
@@ -53,8 +55,13 @@ def get_hourly_sentiment(ticker: str, api_key: str) -> dict:
         ))
         
     if not news_list: return {"error": "No recent news found."}
-        
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.0)
+
+    llm = AzureAIChatCompletionsModel(
+        endpoint=AZURE_INFERENCE_ENDPOINT,
+        credential=AZURE_INFERENCE_CREDENTIAL,
+        model=DEEPSEEK_MODEL_NAME,
+        temperature=0.0,
+    )
     structured_llm = llm.with_structured_output(SentimentResult)
     payload = [item.model_dump() for item in news_list]
     
@@ -64,9 +71,13 @@ def get_hourly_sentiment(ticker: str, api_key: str) -> dict:
     except Exception as e:
         return {"error": f"LLM Error: {str(e)}"}
 
-def analyze_sector_with_gemini(sector_name: str, etf_ticker: str, top_stocks: list[str], api_key: str) -> SectorAnalysisResult:
-    os.environ["GOOGLE_API_KEY"] = api_key
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.0)
+def analyze_sector_with_deepseek(sector_name: str, etf_ticker: str, top_stocks: list[str]) -> SectorAnalysisResult:
+    llm = AzureAIChatCompletionsModel(
+        endpoint=AZURE_INFERENCE_ENDPOINT,
+        credential=AZURE_INFERENCE_CREDENTIAL,
+        model=DEEPSEEK_MODEL_NAME,
+        temperature=0.0,
+    )
     structured_llm = llm.with_structured_output(SectorAnalysisResult)
     
     prompt = f"Sector: {sector_name} ({etf_ticker})\nTop Stocks: {top_stocks}"

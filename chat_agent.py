@@ -1,13 +1,16 @@
 import os
 import yfinance as yf
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 
+from config import AZURE_INFERENCE_ENDPOINT, AZURE_INFERENCE_CREDENTIAL, DEEPSEEK_MODEL_NAME
+
 def get_financial_agent():
-    """Initializes a native LangChain tool-calling agent with memory."""
-    if not os.environ.get("GOOGLE_API_KEY"):
+    """Initializes a native LangChain tool-calling agent with memory, backed by
+    DeepSeek V4 Flash deployed in Azure AI Foundry."""
+    if not AZURE_INFERENCE_ENDPOINT or not AZURE_INFERENCE_CREDENTIAL:
         return None
 
     @tool
@@ -43,9 +46,14 @@ def get_financial_agent():
         """Use this to search the web for the latest news, market events, or macroeconomic updates regarding a stock."""
         return search_tool.run(query)
 
-    # Bind tools directly to the Gemini LLM
+    # Bind tools directly to the DeepSeek V4 Flash LLM (via Azure AI Foundry)
     tools = [get_stock_fundamentals, get_historical_performance, web_news_search]
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1).bind_tools(tools)
+    llm = AzureAIChatCompletionsModel(
+        endpoint=AZURE_INFERENCE_ENDPOINT,
+        credential=AZURE_INFERENCE_CREDENTIAL,
+        model=DEEPSEEK_MODEL_NAME,
+        temperature=0.1,
+    ).bind_tools(tools)
     tools_map = {t.name: t for t in tools}
 
     class BulletproofAgent:
