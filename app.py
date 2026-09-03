@@ -9,8 +9,8 @@ from datetime import datetime
 from config import (
     ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
     USE_REGIME_GATE, REGIME_BENCHMARK,
-    SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT,
-    CHAT_HISTORY_DIR, WATCHLIST_FILE
+    SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SWING, SHOW_TAB_SENTIMENT,
+    SHOW_TAB_CHATBOT, CHAT_HISTORY_DIR, WATCHLIST_FILE
 )
 import data as data_mod
 from breakout import SwingBreakoutMonitor
@@ -19,6 +19,7 @@ from sizing import SizingParams
 from strategy import StrategyParams, add_indicators
 from chat_history import ChatHistoryStore, make_message
 from watchlist import WatchlistStore
+import swing_screener as swing
 from strategy import AssetClass, Position
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
@@ -63,6 +64,33 @@ def fetch_sector_price_history(tickers: tuple, period: str = "6mo") -> dict:
         except Exception:
             continue
     return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_swing_scan(tickers: tuple, overrides: tuple, use_demo: bool, demo_size: int):
+    """Run the Swing Universe Funnel. Cached — a full scan is expensive.
+
+    ``overrides`` is a tuple of (key, value) pairs so the cache key stays hashable.
+    """
+    cfg = dict(swing.CFG)
+    cfg.update(dict(overrides))
+
+    if use_demo:
+        bars = swing.load_demo(n_names=demo_size, seed=11)
+        sector_data = None
+    else:
+        bars = swing.load_yfinance(sorted(set(list(tickers) + ["SPY"])))
+        sector_data = swing.load_yfinance(swing.SECTOR_ETFS)
+
+    if "SPY" not in bars:
+        return None, {"stage": "no SPY series — the regime layer needs one"}, cfg
+
+    spy = bars.pop("SPY")
+    if not bars:
+        return None, {"stage": "no symbols survived loading"}, cfg
+
+    out, ctx = swing.run_scan(bars, spy, cfg, sector_data=sector_data)
+    return out, ctx, cfg
 
 
 def render_price_chart(ticker: str, df: pd.DataFrame, height: int = 360):
@@ -229,6 +257,7 @@ st.markdown("---")
 tab_titles = []
 if SHOW_TAB_BREAKOUT: tab_titles.append("📈 Monitoring")
 if SHOW_TAB_SCREENER: tab_titles.append("🔍 Stock Selection Screener")
+if SHOW_TAB_SWING: tab_titles.append("🎯 Swing Screener")
 if SHOW_TAB_SENTIMENT: tab_titles.append("🧠 AI Sector & News Sentiment")
 if SHOW_TAB_CHATBOT: tab_titles.append("💬 AI Financial Assistant")
 
@@ -388,7 +417,168 @@ if SHOW_TAB_SCREENER:
                 st.rerun()
     tab_index += 1
 
-# TAB 3: AI Sentiment 
+# TAB 3: Swing Universe Funnel
+if SHOW_TAB_SWING:
+    with rendered_tabs[tab_index]:
+        st.subheader("🎯 Swing Universe Funnel")
+        st.markdown(
+            "Liquidity gate → tradability → regime → setup (momentum pullback or "
+            "ICT 2022 on daily bars) → earnings gate → sizing → ranking."
+        )
+
+        sc1, sc2 = st.columns([3, 2])
+        with sc1:
+            universe_choice = st.radio(
+                "Universe", ["Demo (synthetic)", "Portfolio + Watchlist", "Custom list"],
+                horizontal=True, key="swing_universe",
+                help="Demo runs offline on generated bars. The others fetch ~3y of daily bars.",
+            )
+        with sc2:
+            demo_size = st.slider("Demo universe size", 40, 300, 200, 20,
+                                  disabled=universe_choice != "Demo (synthetic)")
+
+        custom_text = ""
+        if universe_choice == "Custom list":
+            custom_text = st.text_input(
+                "Tickers (comma separated)", value="AAPL,MSFT,NVDA,AMD,AVGO,TSM,META,GOOGL",
+                key="swing_custom",
+            )
+
+        with st.expander("Thresholds"):
+            t1, t2, t3 = st.columns(3)
+            with t1:
+                swing_equity = st.number_input("Account equity ($)", value=float(account_equity),
+                                               min_value=1000.0, step=1000.0, key="swing_equity")
+                risk_per_trade = st.slider("Risk per trade", 0.0025, 0.02,
+                                           float(swing.CFG["risk_per_trade"]), 0.0025,
+                                           format="%.4f")
+            with t2:
+                keep_pct = st.slider("Tradability keep %", 0.10, 1.00,
+                                     float(swing.CFG["tradability_keep_pct"]), 0.05,
+                                     help="Fraction of gate survivors kept before the setup layer.")
+                max_positions = st.number_input("Max positions", 1, 20,
+                                                int(swing.CFG["max_positions"]))
+            with t3:
+                adr_lo, adr_hi = st.slider("ADR% band", 0.5, 12.0,
+                                           (float(swing.CFG["adr_min"]), float(swing.CFG["adr_max"])), 0.1)
+                er_min = st.slider("Min efficiency ratio", 0.0, 0.8,
+                                   float(swing.CFG["er_min"]), 0.05)
+            st.caption(
+                "Every constant here is a starting value the author flags as unvalidated. "
+                "Sweep them in a backtest before trading them."
+            )
+
+        overrides = (
+            ("account_equity", float(swing_equity)),
+            ("risk_per_trade", float(risk_per_trade)),
+            ("tradability_keep_pct", float(keep_pct)),
+            ("max_positions", int(max_positions)),
+            ("adr_min", float(adr_lo)),
+            ("adr_max", float(adr_hi)),
+            ("er_min", float(er_min)),
+        )
+
+        if universe_choice == "Portfolio + Watchlist":
+            swing_tickers = tuple(sorted(set(list(holdings) + all_watched)))
+        elif universe_choice == "Custom list":
+            swing_tickers = tuple(sorted({t.strip().upper() for t in custom_text.split(",") if t.strip()}))
+        else:
+            swing_tickers = ()
+
+        use_demo = universe_choice == "Demo (synthetic)"
+        if not use_demo and not swing_tickers:
+            st.info("Add some symbols to scan, or switch to the demo universe.")
+        else:
+            if st.button("🔄 Rescan", key="swing_rescan"):
+                run_swing_scan.clear()
+
+            with st.spinner("Running the funnel..."):
+                try:
+                    swing_out, swing_ctx, swing_cfg = run_swing_scan(
+                        swing_tickers, overrides, use_demo, int(demo_size)
+                    )
+                except Exception as exc:
+                    swing_out, swing_ctx, swing_cfg = None, {"stage": f"scan failed: {exc}"}, {}
+
+            if swing_out is None:
+                st.error(f"⚠️ {swing_ctx.get('stage', 'scan produced nothing')}")
+            else:
+                regime = str(swing_ctx.get("regime", "unknown"))
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("As of", str(swing_ctx.get("asof", "—")))
+                r2.metric("Regime", regime.replace("_", " ").upper())
+                breadth = swing_ctx.get("breadth")
+                r3.metric("Breadth", f"{breadth:.0%}" if breadth == breadth else "—")
+                r4.metric("Slots", swing_ctx.get("slots", 0))
+
+                st.markdown(
+                    f"**Funnel** — {swing_ctx.get('universe', 0)} universe → "
+                    f"{swing_ctx.get('gated', 0)} liquidity gate → "
+                    f"{swing_ctx.get('floor_ok', 0)} tradability floor → "
+                    f"{swing_ctx.get('tradable', 0)} tradable → "
+                    f"**{len(swing_out)} with a setup**"
+                )
+
+                if regime == "risk_off":
+                    st.warning("🚫 Regime is risk-off. The long side is closed and no candidates are produced.")
+
+                if swing_out.empty:
+                    st.info(f"No candidates — {swing_ctx.get('stage', 'nothing qualified')}.")
+                else:
+                    display_cols = ["ticker", "variant", "close", "entry", "stop", "tp1",
+                                    "tp2", "r_tp1", "shares", "risk_$", "adr%", "er", "gap", "score"]
+                    shown = swing_out[[c for c in display_cols if c in swing_out.columns]].copy()
+                    shown["score"] = shown["score"].round(2)
+                    shown["close"] = shown["close"].round(2)
+                    st.dataframe(shown, width="stretch", hide_index=True)
+
+                    slots = int(swing_ctx.get("slots", 0)) or len(swing_out)
+                    st.markdown(f"#### Book — top {min(slots, len(swing_out))} by composite score")
+                    for _, cand in swing_out.head(slots).iterrows():
+                        ticker = str(cand["ticker"])
+                        risk_per_share = float(cand["entry"]) - float(cand["stop"])
+                        with st.container(border=True):
+                            h1, h2 = st.columns([5, 2])
+                            with h1:
+                                st.markdown(f"**{ticker}** · {cand['variant']} — {cand['note']}")
+                                st.caption(
+                                    f"Entry ${cand['entry']:,.2f} · Stop ${cand['stop']:,.2f} "
+                                    f"(${risk_per_share:,.2f}/share) · TP1 ${cand['tp1']:,.2f} "
+                                    f"· TP2 ${cand['tp2']:,.2f} · {cand['shares']:,} shares "
+                                    f"risking ${cand['risk_$']:,.0f}"
+                                )
+                            with h2:
+                                if ticker in holdings:
+                                    st.button("✅ already a holding", key=f"swing_add_{ticker}",
+                                              disabled=True, width="stretch")
+                                elif ticker in watched_set:
+                                    st.button("👁️ on watchlist", key=f"swing_add_{ticker}",
+                                              disabled=True, width="stretch")
+                                else:
+                                    if st.button(f"➕ Watch {ticker}", key=f"swing_add_{ticker}",
+                                                 type="primary", width="stretch"):
+                                        watchlist_store.add(ticker, sector=str(cand["variant"]),
+                                                            source="swing_screener")
+                                        st.toast(f"Added {ticker} to the watchlist.")
+                                        st.rerun()
+
+                    st.download_button(
+                        "⬇️ Download candidates as CSV",
+                        swing_out.to_csv(index=False).encode("utf-8"),
+                        file_name=f"swing_candidates_{swing_ctx.get('asof', 'scan')}.csv",
+                        mime="text/csv",
+                    )
+
+                rejects = swing_ctx.get("rejects") or {}
+                if rejects:
+                    with st.expander(f"Rejected by the liquidity gate ({len(rejects)})"):
+                        st.dataframe(
+                            pd.DataFrame(sorted(rejects.items()), columns=["Ticker", "Reason"]),
+                            width="stretch", hide_index=True,
+                        )
+    tab_index += 1
+
+# TAB 4: AI Sentiment 
 if SHOW_TAB_SENTIMENT:
     with rendered_tabs[tab_index]:
         sentiment_ticker = st.selectbox("Select Asset for AI Analysis:", monitored_tickers, key="sentiment_box")
@@ -407,7 +597,7 @@ if SHOW_TAB_SENTIMENT:
                 st.caption(f"📰 **{art['publisher']}**: {art['title']}")
     tab_index += 1
 
-# TAB 4: LangChain AI Financial Assistant
+# TAB 5: LangChain AI Financial Assistant
 if SHOW_TAB_CHATBOT:
     with rendered_tabs[tab_index]:
         chat_store = ChatHistoryStore(CHAT_HISTORY_DIR)
