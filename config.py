@@ -25,6 +25,7 @@ SHOW_TAB_SCREENER = parse_bool(os.getenv("SHOW_TAB_SCREENER"), True)
 SHOW_TAB_SENTIMENT = parse_bool(os.getenv("SHOW_TAB_SENTIMENT"), True)
 # app.py has always imported SHOW_TAB_CHATBOT; only SHOW_TAB_PORTFOLIO was defined,
 # so importing app.py raised ImportError before this was added.
+SHOW_TAB_SWING = parse_bool(os.getenv("SHOW_TAB_SWING"), True)
 SHOW_TAB_CHATBOT = parse_bool(os.getenv("SHOW_TAB_CHATBOT"), True)
 SHOW_TAB_PORTFOLIO = parse_bool(os.getenv("SHOW_TAB_PORTFOLIO"), False)
 

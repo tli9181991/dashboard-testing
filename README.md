@@ -21,11 +21,18 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
    - Visualizes 6-month normalized relative performance charts.
    - Caches data locally to optimize API usage and speed.
 
-3. **🧠 AI Sector & News Sentiment**
+3. **🎯 Swing Universe Funnel**
+   - A seven-layer screen: liquidity gate → tradability score → regime & sector veto → setup layer → earnings gate → position sizing → composite ranking.
+   - Two setups on daily bars: a momentum pullback continuation and an ICT 2022 model (sweep → displacement MSS → FVG entry).
+   - Every candidate arrives as a complete trade plan — entry, stop, TP1, TP2, share count and dollar risk.
+   - Runs offline against a synthetic universe, or against your portfolio, watchlist or a custom ticker list.
+   - Also usable standalone: `python swing_screener.py --source demo`.
+
+4. **🧠 AI Sector & News Sentiment**
    - Fetches the latest market news for your portfolio assets.
    - Leverages Google Gemini to synthesize news and generate an aggregated sentiment score and label (Bullish, Bearish, Neutral).
 
-4. **💬 AI Financial Assistant (LangChain)**
+5. **💬 AI Financial Assistant (LangChain)**
    - A custom tool-calling agent equipped with `yfinance` and DuckDuckGo Web Search.
    - Capable of fetching live fundamentals, analyzing historical trends, and summarizing macroeconomic web news.
    - Features a robust conversational memory layer for continuous chat context.
@@ -46,6 +53,7 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 - `app.py`: The Streamlit dashboard UI and orchestration layer.
 - `breakout.py`: Live monitoring path — a thin shell over `strategy.evaluate`.
 - `screening.py`: Scrapes the S&P 500, evaluates Stage-2 parameters, caches top sector performers.
+- `swing_screener.py`: The Swing Universe Funnel — liquidity, tradability, regime, setups, events, sizing and ranking. Runs in the dashboard or as a CLI.
 - `chat_agent.py`: LangChain tool-calling agent with conversational memory.
 - `sentiment.py`: AI-driven news scraper and sentiment evaluator.
 - `config.py`: Environment variable loading and global parameters.
