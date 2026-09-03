@@ -39,6 +39,9 @@ REGIME_BENCHMARK = os.getenv("REGIME_BENCHMARK", "^GSPC")
 CACHE_DIR = Path("./.screen_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Symbols to monitor without holding a position (see watchlist.py).
+WATCHLIST_FILE = Path(os.getenv("WATCHLIST_FILE", "./watchlist.json"))
+
 # Assistant conversations are stored here, one JSON file each (see chat_history.py).
 CHAT_HISTORY_DIR = Path(os.getenv("CHAT_HISTORY_DIR", "./.chat_history"))
 

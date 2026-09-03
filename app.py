@@ -10,7 +10,7 @@ from config import (
     ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
     USE_REGIME_GATE, REGIME_BENCHMARK,
     SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT,
-    CHAT_HISTORY_DIR
+    CHAT_HISTORY_DIR, WATCHLIST_FILE
 )
 import data as data_mod
 from breakout import SwingBreakoutMonitor
@@ -18,6 +18,8 @@ from positions import load_portfolio, conversion_notes
 from sizing import SizingParams
 from strategy import StrategyParams, add_indicators
 from chat_history import ChatHistoryStore, make_message
+from watchlist import WatchlistStore
+from strategy import AssetClass, Position
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
@@ -110,10 +112,30 @@ use_regime_gate = st.sidebar.checkbox("Regime gate on new entries", value=USE_RE
 sizing_params = SizingParams(target_vol=target_vol, max_position_pct=max_position_pct)
 
 holdings = load_portfolio()
-portfolio_tickers = list(holdings.keys())
+watchlist_store = WatchlistStore(WATCHLIST_FILE)
 
-if not portfolio_tickers:
-    st.warning("⚠️ `portfolio.csv` is empty or missing. Please add tickers to the file to monitor.")
+# Watchlist names are monitored with a flat position, so the strategy reports the
+# entry signal rather than an exit. A symbol held in portfolio.csv stays a holding.
+all_watched = watchlist_store.symbols()
+watched_set = set(all_watched)
+watchlist_symbols = [s for s in all_watched if s not in holdings]
+
+monitored: dict[str, dict] = {
+    symbol: {"position": h.position, "asset_class": h.asset_class, "held": True}
+    for symbol, h in holdings.items()
+}
+for symbol in watchlist_symbols:
+    monitored[symbol] = {
+        "position": Position(),
+        "asset_class": AssetClass.infer(symbol),
+        "held": False,
+    }
+
+if not monitored:
+    st.warning(
+        "⚠️ Nothing to monitor yet. Add positions to `portfolio.csv`, "
+        "or pick stocks from the Screener tab to build a watchlist."
+    )
     st.stop()
 
 for note in conversion_notes(holdings):
@@ -128,15 +150,23 @@ if use_regime_gate:
     else:
         benchmark_close = bench["Close"]
 
+def _format_units(quantity: float, asset_class) -> str:
+    if asset_class is AssetClass.CRYPTO:
+        return f"{quantity:,.6f}".rstrip("0").rstrip(".")
+    return f"{quantity:,.0f}"
+
+
 views = {}
-summary_data = []
+holding_rows = []
+watchlist_rows = []
 total_portfolio_pnl = 0.0
 failed = []
 
-for ticker, holding in holdings.items():
+for ticker, entry in monitored.items():
+    position, asset_class, held = entry["position"], entry["asset_class"], entry["held"]
     monitor = SwingBreakoutMonitor(
         symbol=ticker,
-        position=holding.position,
+        position=position,
         equity=account_equity,
         sizing_params=sizing_params,
     )
@@ -147,23 +177,30 @@ for ticker, holding in holdings.items():
         continue
 
     views[ticker] = view
-    total_portfolio_pnl += view.unrealized_pnl
     regime_label = "risk-on" if view.regime_ok else "risk-off"
 
-    summary_data.append({
+    common = {
         "Ticker": ticker,
         "Current Price": f"${view.price:,.2f}",
         "10 SMA": f"${view.decision.sma_exit:,.2f}",
         "Next Resistance": f"${view.decision.next_resistance:,.2f}" if view.decision.next_resistance else "N/A",
-        "Avg Cost": f"${holding.position.avg_price:,.2f}" if holding.position.avg_price > 0 else "$0.00",
-        "Quantity": f"{holding.quantity:,.6f}".rstrip("0").rstrip(".") if holding.asset_class.value == "crypto" else f"{holding.quantity:,.0f}",
         "Ann. Vol": f"{view.ann_vol:.1%}",
-        "Target Size": f"{view.target_quantity:,.4f}".rstrip("0").rstrip(".") if holding.asset_class.value == "crypto" else f"{view.target_quantity:,.0f}",
+        "Target Size": _format_units(view.target_quantity, asset_class),
         "Target $": f"${view.target_notional:,.0f}",
-        "Unrealized PnL": f"${view.unrealized_pnl:,.2f}",
-        "Long Term": "Yes" if holding.position.long_term else "No",
         "Signal": view.signal,
-    })
+    }
+
+    if held:
+        total_portfolio_pnl += view.unrealized_pnl
+        holding_rows.append({
+            **common,
+            "Avg Cost": f"${position.avg_price:,.2f}" if position.avg_price > 0 else "$0.00",
+            "Quantity": _format_units(position.quantity, asset_class),
+            "Unrealized PnL": f"${view.unrealized_pnl:,.2f}",
+            "Long Term": "Yes" if position.long_term else "No",
+        })
+    else:
+        watchlist_rows.append(common)
 
 for message in failed:
     st.error(f"⚠️ {message}")
@@ -172,13 +209,14 @@ if not views:
     st.error("No symbols could be evaluated. Check connectivity, then press Force Refresh.")
     st.stop()
 
-portfolio_tickers = list(views.keys())
+monitored_tickers = list(views.keys())
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Monitored Assets", len(portfolio_tickers))
-m2.metric("Aggregate Unrealized PnL", f"${total_portfolio_pnl:,.2f}",
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Holdings", len(holding_rows))
+m2.metric("Watchlist", len(watchlist_rows))
+m3.metric("Aggregate Unrealized PnL", f"${total_portfolio_pnl:,.2f}",
           delta_color="normal" if total_portfolio_pnl >= 0 else "inverse")
-m3.metric("Market Regime", regime_label.upper() if use_regime_gate and benchmark_close is not None else "GATE OFF")
+m4.metric("Market Regime", regime_label.upper() if use_regime_gate and benchmark_close is not None else "GATE OFF")
 
 if use_regime_gate and benchmark_close is not None and regime_label == "risk-off":
     st.info(f"🚦 {REGIME_BENCHMARK} is below its 200 SMA — new entries are vetoed. Exits are unaffected.")
@@ -189,7 +227,7 @@ st.markdown("---")
 # Tabs Navigation
 # =============================================================================
 tab_titles = []
-if SHOW_TAB_BREAKOUT: tab_titles.append("📈 Portfolio Breakout Monitor")
+if SHOW_TAB_BREAKOUT: tab_titles.append("📈 Monitoring")
 if SHOW_TAB_SCREENER: tab_titles.append("🔍 Stock Selection Screener")
 if SHOW_TAB_SENTIMENT: tab_titles.append("🧠 AI Sector & News Sentiment")
 if SHOW_TAB_CHATBOT: tab_titles.append("💬 AI Financial Assistant")
@@ -197,20 +235,43 @@ if SHOW_TAB_CHATBOT: tab_titles.append("💬 AI Financial Assistant")
 rendered_tabs = st.tabs(tab_titles)
 tab_index = 0
 
-# TAB 1: Breakout Execution
+# TAB 1: Monitoring (holdings + watchlist)
 if SHOW_TAB_BREAKOUT:
     with rendered_tabs[tab_index]:
-        st.subheader("Watchlist Summary (portfolio.csv)")
-        summary_df = pd.DataFrame(summary_data)
-        # FIXED: Changed use_container_width=True to width="stretch"
-        st.dataframe(summary_df, width="stretch", hide_index=True)
+        st.subheader("Holdings (portfolio.csv)")
+        if holding_rows:
+            st.dataframe(pd.DataFrame(holding_rows), width="stretch", hide_index=True)
+        else:
+            st.caption("No positions in `portfolio.csv`.")
+
+        st.subheader("Watchlist")
+        if watchlist_rows:
+            st.dataframe(pd.DataFrame(watchlist_rows), width="stretch", hide_index=True)
+            st.caption(
+                "Watchlist names are evaluated with no position, so BUY marks a fresh "
+                "entry signal. They carry no PnL until you add them to `portfolio.csv`."
+            )
+            st.caption("Remove from watchlist:")
+            remove_cols = st.columns(min(len(watchlist_rows), 6))
+            for n, row in enumerate(watchlist_rows):
+                watched_ticker = row["Ticker"]
+                with remove_cols[n % len(remove_cols)]:
+                    if st.button(f"✕ {watched_ticker}", key=f"wl_remove_{watched_ticker}",
+                                 width="stretch",
+                                 help=f"Stop watching {watched_ticker}"):
+                        watchlist_store.remove(watched_ticker)
+                        st.toast(f"Removed {watched_ticker} from the watchlist.")
+                        st.rerun()
+        else:
+            st.caption("Empty. Pick stocks from the 🔍 Screener tab to start watching them.")
+
         st.markdown("---")
         
         col1, col2 = st.columns([2, 1])
         with col1:
-            chart_ticker = st.selectbox("Select Asset to Chart:", portfolio_tickers)
+            chart_ticker = st.selectbox("Select Asset to Chart:", monitored_tickers)
             active_df = views[chart_ticker].df
-            avg_entry = holdings[chart_ticker].position.avg_price
+            avg_entry = holdings[chart_ticker].position.avg_price if chart_ticker in holdings else 0.0
             
             fig = go.Figure()
             fig.add_trace(go.Candlestick(x=active_df.index, open=active_df['Open'], high=active_df['High'], low=active_df['Low'], close=active_df['Close'], name=chart_ticker))
@@ -220,7 +281,7 @@ if SHOW_TAB_BREAKOUT:
             fig.add_trace(go.Scatter(x=active_df.index, y=active_df['EMA_20'], mode='lines', name='20 EMA', line=dict(color='#00FF00', width=1)))
             fig.add_trace(go.Scatter(x=active_df.index, y=active_df['EMA_200'], mode='lines', name='200 EMA', line=dict(color='#FFFFFF', width=2)))
             
-            if holdings[chart_ticker].quantity > 0:
+            if chart_ticker in holdings and holdings[chart_ticker].quantity > 0:
                 fig.add_hline(y=avg_entry, line_dash="dot", line_color="green", annotation_text=f"Avg Entry ${avg_entry:,.2f}")
                 
             fig.update_layout(
@@ -287,6 +348,33 @@ if SHOW_TAB_SCREENER:
                                     if frame is None or frame.empty:
                                         st.caption(f"No price data for {ticker}.")
                                         continue
+
+                                    # Add / remove this name from the monitoring tab.
+                                    if ticker in holdings:
+                                        st.button(
+                                            f"✅ {ticker} — already a holding",
+                                            key=f"watch_{sector_name}_{ticker}",
+                                            disabled=True, width="stretch",
+                                        )
+                                    elif ticker in watched_set:
+                                        if st.button(
+                                            f"👁️ {ticker} — watching (click to remove)",
+                                            key=f"watch_{sector_name}_{ticker}",
+                                            width="stretch",
+                                        ):
+                                            watchlist_store.remove(ticker)
+                                            st.toast(f"Removed {ticker} from the watchlist.")
+                                            st.rerun()
+                                    else:
+                                        if st.button(
+                                            f"➕ Add {ticker} to watchlist",
+                                            key=f"watch_{sector_name}_{ticker}",
+                                            type="primary", width="stretch",
+                                        ):
+                                            watchlist_store.add(ticker, sector=sector_name, source="screener")
+                                            st.toast(f"Added {ticker} to the watchlist.")
+                                            st.rerun()
+
                                     st.plotly_chart(
                                         render_price_chart(ticker, frame),
                                         width="stretch",
@@ -303,7 +391,7 @@ if SHOW_TAB_SCREENER:
 # TAB 3: AI Sentiment 
 if SHOW_TAB_SENTIMENT:
     with rendered_tabs[tab_index]:
-        sentiment_ticker = st.selectbox("Select Portfolio Asset for AI Analysis:", portfolio_tickers, key="sentiment_box")
+        sentiment_ticker = st.selectbox("Select Asset for AI Analysis:", monitored_tickers, key="sentiment_box")
         st.subheader(f"AI News Synthesis ({sentiment_ticker})")
         
         # Auth is read from AZURE_INFERENCE_ENDPOINT / AZURE_INFERENCE_CREDENTIAL in config.py
