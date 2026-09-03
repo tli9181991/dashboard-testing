@@ -20,6 +20,11 @@ from strategy import StrategyParams, add_indicators
 from chat_history import ChatHistoryStore, make_message
 from watchlist import WatchlistStore
 import swing_screener as swing
+import swing_charts as swing_charts
+import backtest_charts
+import simulation as sim
+from backtest import BacktestConfig, CostModel, run_backtest
+import swing_backtest as swing_bt
 from strategy import AssetClass, Position
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
@@ -67,6 +72,118 @@ def fetch_sector_price_history(tickers: tuple, period: str = "6mo") -> dict:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def fetch_backtest_history(tickers: tuple, period: str = "5y") -> dict:
+    """Raw OHLCV for the backtester. Longer than the chart window, and left
+    un-annotated because ``strategy.prepare`` adds its own indicators."""
+    if not tickers:
+        return {}
+    raw = yf.download(list(tickers), period=period, interval="1d", progress=False,
+                      group_by="ticker", auto_adjust=True)
+    if raw is None or raw.empty:
+        return {}
+
+    out = {}
+    for ticker in tickers:
+        try:
+            sub = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
+            sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if len(sub) > 250:
+                out[ticker] = sub
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_screener_backtest(tickers: tuple, period: str, equity: float, target_vol: float,
+                          max_position_pct: float, use_regime: bool,
+                          slippage_bps: float, commission_bps: float, n_paths: int):
+    """Backtest the breakout strategy over the screened names, then simulate.
+
+    Returns (result, report, price_data) or (None, reason, {}).
+    """
+    price_data = fetch_backtest_history(tickers, period=period)
+    if not price_data:
+        return None, "No price history could be loaded for these tickers.", {}
+
+    benchmark = None
+    if use_regime:
+        bench = data_mod.load_history(REGIME_BENCHMARK, period=period)
+        if not bench.empty:
+            benchmark = bench["Close"]
+
+    config = BacktestConfig(
+        initial_equity=equity,
+        use_regime_gate=use_regime and benchmark is not None,
+        sizing=SizingParams(target_vol=target_vol, max_position_pct=max_position_pct),
+        costs=CostModel(slippage_bps=slippage_bps, commission_bps=commission_bps),
+    )
+    try:
+        result = run_backtest(price_data, benchmark, config)
+    except Exception as exc:
+        return None, f"Backtest failed: {exc}", {}
+
+    report = sim.summarise(result, price_data, sim.SimulationParams(n_paths=int(n_paths)))
+    return result, report, price_data
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_swing_strategy_backtest(tickers: tuple, period: str, equity: float,
+                                risk_per_trade: float, max_hold: int, order_ttl: int,
+                                tp1_fraction: float, slippage_bps: float,
+                                commission_bps: float, use_regime: bool,
+                                variants: tuple, n_paths: int, both_ways: bool):
+    """Replay the swing setups over these names, then simulate.
+
+    Returns (result, report, bound) or (None, reason, None). ``bound`` is the
+    intrabar-ambiguity pair when requested, otherwise None.
+    """
+    price_data = fetch_backtest_history(tickers, period=period)
+    if not price_data:
+        return None, "No price history could be loaded for these tickers.", None
+
+    spy = data_mod.load_history("SPY", period=period)
+    if spy.empty:
+        spy = data_mod.load_history(REGIME_BENCHMARK, period=period)
+    if spy.empty:
+        return None, "The regime layer needs a market series (SPY) and none loaded.", None
+
+    cfg = dict(swing.CFG)
+    cfg["account_equity"] = equity
+    cfg["risk_per_trade"] = risk_per_trade
+
+    config = swing_bt.SwingBacktestConfig(
+        initial_equity=equity, max_hold=int(max_hold), order_ttl=int(order_ttl),
+        tp1_fraction=float(tp1_fraction), slippage_bps=float(slippage_bps),
+        commission_bps=float(commission_bps), use_regime=bool(use_regime),
+        variants=tuple(variants),
+    )
+
+    try:
+        result = swing_bt.run_swing_backtest(price_data, spy, cfg, config)
+    except Exception as exc:
+        return None, f"Backtest failed: {exc}", None
+
+    params = sim.SimulationParams(n_paths=int(n_paths))
+    report = {
+        "metrics": result.metrics,
+        "r_bootstrap": sim.bootstrap_r_paths(result.trades["r_multiple"], params)
+        if not result.trades.empty else None,
+        "buy_and_hold": sim.buy_and_hold(price_data),
+        "random_entry": sim.random_entry_benchmark(price_data, result.trades, params)
+        if not result.trades.empty else None,
+    }
+
+    bound = None
+    if both_ways:
+        try:
+            bound = swing_bt.ambiguity_bound(price_data, spy, cfg, config)
+        except Exception:
+            bound = None
+    return result, report, bound
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def run_swing_scan(tickers: tuple, overrides: tuple, use_demo: bool, demo_size: int):
     """Run the Swing Universe Funnel. Cached — a full scan is expensive.
 
@@ -83,14 +200,20 @@ def run_swing_scan(tickers: tuple, overrides: tuple, use_demo: bool, demo_size: 
         sector_data = swing.load_yfinance(swing.SECTOR_ETFS)
 
     if "SPY" not in bars:
-        return None, {"stage": "no SPY series — the regime layer needs one"}, cfg
+        return None, {"stage": "no SPY series — the regime layer needs one"}, cfg, {}
 
     spy = bars.pop("SPY")
     if not bars:
-        return None, {"stage": "no symbols survived loading"}, cfg
+        return None, {"stage": "no symbols survived loading"}, cfg, {}
 
     out, ctx = swing.run_scan(bars, spy, cfg, sector_data=sector_data)
-    return out, ctx, cfg
+
+    # Keep the bars behind each candidate so the trade-plan charts do not have to
+    # fetch the same history again. Trimmed, since only the recent window is drawn.
+    candidate_bars = {}
+    if out is not None and not out.empty:
+        candidate_bars = {t: bars[t].tail(260) for t in out["ticker"].unique() if t in bars}
+    return out, ctx, cfg, candidate_bars
 
 
 def render_price_chart(ticker: str, df: pd.DataFrame, height: int = 360):
@@ -411,6 +534,155 @@ if SHOW_TAB_SCREENER:
                                     )
                 st.markdown("---")
             
+        # ── Strategy backtest over the screened names ───────────────────────
+        st.markdown("---")
+        st.subheader("📉 Strategy backtest on the screened stocks")
+
+        all_screened = sorted(cached_top5["ticker"].unique()) if not cached_top5.empty else []
+        if not all_screened:
+            st.caption("Run a screen first — there is nothing to backtest yet.")
+        else:
+            st.warning(
+                "**These results are selection-biased and are not an edge estimate.** "
+                "These stocks were picked *today* for already having trended, so a "
+                "strategy replayed over their history is being handed names that are "
+                "known to have gone up. Read the comparisons below, not the absolute "
+                "return: the strategy, buy-and-hold and the random-entry benchmark all "
+                "inherit the same bias, so the differences between them still mean "
+                "something."
+            )
+
+            b1, b2, b3 = st.columns([2, 1, 1])
+            with b1:
+                sectors_available = sorted(s for s in cached_top5["sector"].unique() if s != "Unknown")
+                scope = st.selectbox(
+                    "Scope", ["All screened stocks"] + [f"Sector: {s}" for s in sectors_available],
+                    key="bt_scope",
+                )
+            with b2:
+                bt_period = st.selectbox("History", ["2y", "3y", "5y", "10y"], index=2, key="bt_period")
+            with b3:
+                bt_paths = st.select_slider("Simulated paths", [200, 500, 1000, 2000, 5000],
+                                            value=1000, key="bt_paths")
+
+            with st.expander("Cost and risk assumptions"):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    bt_slippage = st.slider("Slippage (bps, one way)", 0.0, 50.0, 5.0, 1.0,
+                                            help="Applied adversely to every fill. Breakout "
+                                                 "entries are where real fills are worst.")
+                with c2:
+                    bt_commission = st.slider("Commission (bps of notional)", 0.0, 20.0, 1.0, 0.5)
+                with c3:
+                    bt_regime = st.checkbox("Apply the regime gate", value=True, key="bt_regime")
+
+            if scope.startswith("Sector: "):
+                wanted = scope.removeprefix("Sector: ")
+                bt_tickers = tuple(sorted(
+                    cached_top5.loc[cached_top5["sector"] == wanted, "ticker"].unique()))
+            else:
+                bt_tickers = tuple(all_screened)
+
+            st.caption(f"{len(bt_tickers)} symbols: {', '.join(bt_tickers)}")
+
+            if st.button("▶️ Run backtest", type="primary", key="bt_run"):
+                run_screener_backtest.clear()
+
+            with st.spinner(f"Replaying {len(bt_tickers)} symbols and simulating..."):
+                bt_result, bt_report, bt_prices = run_screener_backtest(
+                    bt_tickers, bt_period, float(account_equity), float(target_vol),
+                    float(max_position_pct), bool(bt_regime), float(bt_slippage),
+                    float(bt_commission), int(bt_paths),
+                )
+
+            if bt_result is None:
+                st.error(f"⚠️ {bt_report}")
+            elif bt_result.trades.empty:
+                st.info("The strategy took no trades over this window — nothing to simulate.")
+                st.dataframe(pd.DataFrame([bt_result.metrics]), width="stretch", hide_index=True)
+            else:
+                metrics = bt_result.metrics
+                buy_hold = bt_report["buy_and_hold"]
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Strategy return", f"{metrics['total_return']:.1%}")
+                k2.metric("Buy & hold", f"{buy_hold.get('total_return', 0):.1%}",
+                          delta=f"{metrics['total_return'] - buy_hold.get('total_return', 0):.1%}")
+                k3.metric("Sharpe", f"{metrics['sharpe']:.2f}")
+                k4.metric("Max drawdown", f"{metrics['max_drawdown']:.1%}")
+
+                k5, k6, k7, k8 = st.columns(4)
+                k5.metric("Trades", metrics["n_trades"])
+                k6.metric("Win rate", f"{metrics['win_rate']:.0%}")
+                k7.metric("Profit factor", f"{metrics['profit_factor']:.2f}")
+                k8.metric("Time in market", f"{metrics['exposure']:.0%}")
+
+                st.plotly_chart(
+                    backtest_charts.build_equity_comparison(bt_result, buy_hold),
+                    width="stretch", key="bt_equity",
+                )
+                st.caption(
+                    "The strategy sits flat whenever it is out of the market, so beating "
+                    "buy-and-hold through a drawdown may reflect being in cash rather "
+                    "than picking well. The next chart tests the entries themselves."
+                )
+
+                random_entry = bt_report.get("random_entry")
+                if random_entry:
+                    st.plotly_chart(
+                        backtest_charts.build_random_entry_distribution(random_entry),
+                        width="stretch", key="bt_random",
+                    )
+                    pct = random_entry["percentile"]
+                    if pct >= 90:
+                        st.success(
+                            f"The average trade beat {pct:.0f}% of random entries holding "
+                            "for the same lengths — the entry rule is doing work."
+                        )
+                    elif pct >= 60:
+                        st.info(
+                            f"The average trade beat {pct:.0f}% of random entries. Weak "
+                            "evidence the signal adds something beyond exposure."
+                        )
+                    else:
+                        st.warning(
+                            f"The average trade beat only {pct:.0f}% of random entries of "
+                            "the same length. On this data the entry rule is not "
+                            "outperforming simply being in the market that long."
+                        )
+
+                bootstrap = bt_report.get("bootstrap")
+                if bootstrap is not None:
+                    st.plotly_chart(
+                        backtest_charts.build_bootstrap_fan(bootstrap, bt_result.trades["return_pct"]),
+                        width="stretch", key="bt_fan",
+                    )
+                    s = bt_report["bootstrap_summary"]
+                    st.caption(
+                        f"Resampling the trade order {s['n_paths']:,} times: median outcome "
+                        f"{s['median_return']:+.1%}, 5th–95th percentile "
+                        f"{s['p05_return']:+.1%} to {s['p95_return']:+.1%}, "
+                        f"{s['prob_profit']:.0%} of orderings finish profitable, median worst "
+                        f"drawdown {s['median_max_drawdown']:.1%}. A realised path near the "
+                        "edge of the fan owes much of its result to the order the trades "
+                        "happened to arrive in. This compounds per-trade returns at a "
+                        "constant stake, so it does not match the equity curve above."
+                    )
+
+                st.plotly_chart(
+                    backtest_charts.build_per_symbol_returns(bt_result, buy_hold),
+                    width="stretch", key="bt_persym",
+                )
+
+                with st.expander(f"Trade log ({len(bt_result.trades)})"):
+                    st.dataframe(bt_result.trades, width="stretch", hide_index=True)
+                    st.download_button(
+                        "⬇️ Download trades as CSV",
+                        bt_result.trades.to_csv(index=False).encode("utf-8"),
+                        file_name="screener_backtest_trades.csv", mime="text/csv",
+                    )
+
+        st.markdown("---")
         if st.button("Run Fresh Full Stock Rescan (Warning: Takes ~3-5 mins)"):
             with st.spinner("Scraping S&P 500 and executing fresh screening..."):
                 get_or_create_sector_stocks(force_rescan=True)
@@ -494,11 +766,13 @@ if SHOW_TAB_SWING:
 
             with st.spinner("Running the funnel..."):
                 try:
-                    swing_out, swing_ctx, swing_cfg = run_swing_scan(
+                    swing_out, swing_ctx, swing_cfg, swing_bars = run_swing_scan(
                         swing_tickers, overrides, use_demo, int(demo_size)
                     )
                 except Exception as exc:
-                    swing_out, swing_ctx, swing_cfg = None, {"stage": f"scan failed: {exc}"}, {}
+                    swing_out, swing_ctx, swing_cfg, swing_bars = (
+                        None, {"stage": f"scan failed: {exc}"}, {}, {}
+                    )
 
             if swing_out is None:
                 st.error(f"⚠️ {swing_ctx.get('stage', 'scan produced nothing')}")
@@ -511,12 +785,9 @@ if SHOW_TAB_SWING:
                 r3.metric("Breadth", f"{breadth:.0%}" if breadth == breadth else "—")
                 r4.metric("Slots", swing_ctx.get("slots", 0))
 
-                st.markdown(
-                    f"**Funnel** — {swing_ctx.get('universe', 0)} universe → "
-                    f"{swing_ctx.get('gated', 0)} liquidity gate → "
-                    f"{swing_ctx.get('floor_ok', 0)} tradability floor → "
-                    f"{swing_ctx.get('tradable', 0)} tradable → "
-                    f"**{len(swing_out)} with a setup**"
+                st.plotly_chart(
+                    swing_charts.build_funnel(swing_ctx, len(swing_out)),
+                    width="stretch", key="swing_funnel",
                 )
 
                 if regime == "risk_off":
@@ -532,9 +803,35 @@ if SHOW_TAB_SWING:
                     shown["close"] = shown["close"].round(2)
                     st.dataframe(shown, width="stretch", hide_index=True)
 
+                    # The components are z-scores across the scan, so a single
+                    # candidate scores zero on every one of them by definition —
+                    # the chart would be blank rather than informative.
+                    if len(swing_out) >= 2:
+                        st.plotly_chart(
+                            swing_charts.build_score_breakdown(swing_out, swing_cfg),
+                            width="stretch", key="swing_scores",
+                        )
+                        st.caption(
+                            "Components are z-scores across today's candidates, so they are "
+                            "relative to this scan only — a negative bar means below average "
+                            "here, not bad in absolute terms."
+                        )
+                    else:
+                        st.caption(
+                            "Only one candidate today, so there is no cross-section to rank "
+                            "it against — the score breakdown needs at least two."
+                        )
+
+                    # A scatter of one or two points is a stat tile, not a chart.
+                    if len(swing_out) >= 3:
+                        st.plotly_chart(
+                            swing_charts.build_risk_reward(swing_out),
+                            width="stretch", key="swing_risk_reward",
+                        )
+
                     slots = int(swing_ctx.get("slots", 0)) or len(swing_out)
                     st.markdown(f"#### Book — top {min(slots, len(swing_out))} by composite score")
-                    for _, cand in swing_out.head(slots).iterrows():
+                    for rank, (_, cand) in enumerate(swing_out.head(slots).iterrows()):
                         ticker = str(cand["ticker"])
                         risk_per_share = float(cand["entry"]) - float(cand["stop"])
                         with st.container(border=True):
@@ -562,12 +859,252 @@ if SHOW_TAB_SWING:
                                         st.toast(f"Added {ticker} to the watchlist.")
                                         st.rerun()
 
+                            plan_bars = swing_bars.get(ticker)
+                            if plan_bars is None or plan_bars.empty:
+                                st.caption("No price history retained for the chart.")
+                            else:
+                                with st.expander(f"{ticker} trade plan chart",
+                                                 expanded=(rank == 0)):
+                                    st.plotly_chart(
+                                        swing_charts.build_trade_plan(ticker, plan_bars, cand),
+                                        width="stretch", key=f"swing_plan_{ticker}_{rank}",
+                                    )
+
                     st.download_button(
                         "⬇️ Download candidates as CSV",
                         swing_out.to_csv(index=False).encode("utf-8"),
                         file_name=f"swing_candidates_{swing_ctx.get('asof', 'scan')}.csv",
                         mime="text/csv",
                     )
+
+                # ── Strategy backtest over these setups ─────────────────
+                st.markdown("---")
+                st.subheader("📉 Backtest the swing setups")
+                st.caption(
+                    "Replays both setups bar by bar on truncated history, places the "
+                    "entry as a resting order, and manages the bracket to a stop, a "
+                    "partial at TP1, TP2 or a time stop."
+                )
+
+                bt_universe = st.radio(
+                    "Universe", ["Today's candidates", "Portfolio + Watchlist", "Custom list"],
+                    horizontal=True, key="swbt_universe",
+                )
+                if bt_universe == "Today's candidates":
+                    swbt_tickers = tuple(sorted(swing_out["ticker"].unique())) if not swing_out.empty else ()
+                    if swbt_tickers:
+                        st.warning(
+                            "**Backtesting today's candidates is selection-biased.** They "
+                            "were chosen for how they look now, so their history is not a "
+                            "fair sample. Read the comparisons, not the absolute return."
+                        )
+                elif bt_universe == "Portfolio + Watchlist":
+                    swbt_tickers = tuple(sorted(set(list(holdings) + all_watched)))
+                else:
+                    swbt_text = st.text_input("Tickers (comma separated)",
+                                              value="AAPL,MSFT,NVDA,AMD,AVGO,TSM",
+                                              key="swbt_custom")
+                    swbt_tickers = tuple(sorted({t.strip().upper()
+                                                 for t in swbt_text.split(",") if t.strip()}))
+
+                if not swbt_tickers:
+                    st.info("Nothing to backtest — pick a universe with some symbols in it.")
+                else:
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        swbt_period = st.selectbox("History", ["2y", "3y", "5y"], index=1,
+                                                   key="swbt_period")
+                        swbt_variants = st.multiselect(
+                            "Setups", ["A/momentum", "B/ict"],
+                            default=["A/momentum", "B/ict"], key="swbt_variants",
+                        )
+                    with s2:
+                        swbt_risk = st.slider("Risk per trade", 0.0025, 0.02,
+                                              float(swing.CFG["risk_per_trade"]), 0.0025,
+                                              format="%.4f", key="swbt_risk")
+                        swbt_hold = st.number_input("Time stop (sessions)", 5, 90, 30,
+                                                    key="swbt_hold")
+                    with s3:
+                        swbt_ttl = st.number_input("Entry order lives (sessions)", 1, 10, 3,
+                                                   key="swbt_ttl",
+                                                   help="A resting entry that never trades "
+                                                        "is cancelled after this many sessions.")
+                        swbt_tp1 = st.slider("Sold at TP1", 0.0, 1.0, 0.5, 0.25,
+                                             key="swbt_tp1",
+                                             help="The remainder runs on with the stop at "
+                                                  "breakeven. 1.0 exits fully at TP1.")
+
+                    with st.expander("Costs, ties and simulation"):
+                        e1, e2, e3 = st.columns(3)
+                        with e1:
+                            swbt_slip = st.slider("Slippage (bps)", 0.0, 60.0, 8.0, 1.0,
+                                                  key="swbt_slip")
+                            swbt_comm = st.slider("Commission (bps)", 0.0, 20.0, 1.0, 0.5,
+                                                  key="swbt_comm")
+                        with e2:
+                            swbt_regime = st.checkbox("Apply the regime layer", value=True,
+                                                      key="swbt_regime")
+                            swbt_both = st.checkbox(
+                                "Run the intrabar tie both ways", value=True, key="swbt_both",
+                                help="Daily bars cannot say whether the stop or the target "
+                                     "came first when one bar covers both. This runs each "
+                                     "resolution and shows the range. Doubles the runtime.",
+                            )
+                        with e3:
+                            swbt_paths = st.select_slider("Simulated paths",
+                                                          [200, 500, 1000, 2000],
+                                                          value=1000, key="swbt_paths")
+
+                    st.caption(
+                        f"{len(swbt_tickers)} symbols: {', '.join(swbt_tickers)} — "
+                        "a full replay evaluates both setups on every bar, so expect "
+                        "tens of seconds per symbol-year."
+                    )
+
+                    if st.button("▶️ Run swing backtest", type="primary", key="swbt_run"):
+                        run_swing_strategy_backtest.clear()
+
+                    if not swbt_variants:
+                        st.info("Select at least one setup to replay.")
+                    else:
+                        with st.spinner(f"Replaying {len(swbt_tickers)} symbols..."):
+                            swbt_result, swbt_report, swbt_bound = run_swing_strategy_backtest(
+                                swbt_tickers, swbt_period, float(account_equity),
+                                float(swbt_risk), int(swbt_hold), int(swbt_ttl),
+                                float(swbt_tp1), float(swbt_slip), float(swbt_comm),
+                                bool(swbt_regime), tuple(swbt_variants),
+                                int(swbt_paths), bool(swbt_both),
+                            )
+
+                        if swbt_result is None:
+                            st.error(f"⚠️ {swbt_report}")
+                        else:
+                            sm = swbt_result.metrics
+                            q1, q2, q3, q4 = st.columns(4)
+                            q1.metric("Setups seen", sm["setups_seen"])
+                            q2.metric("Orders filled", sm["n_trades"],
+                                      delta=f"{sm['fill_rate']:.0%} of {sm['orders_placed']}")
+                            q3.metric("Expectancy", f"{sm['expectancy_r']:+.2f} R")
+                            q4.metric("Total return", f"{sm['total_return']:+.1%}")
+
+                            st.plotly_chart(
+                                backtest_charts.build_order_funnel(swbt_result.stats, sm["n_trades"]),
+                                width="stretch", key="swbt_funnel",
+                            )
+                            st.caption(
+                                f"{sm['orders_expired']} entry orders expired without "
+                                "trading. A setup is not a position — counting one as the "
+                                "other is the usual way this kind of backtest flatters "
+                                "itself."
+                            )
+
+                            if swbt_result.trades.empty:
+                                st.info("No entry order ever filled, so there is nothing to simulate.")
+                            else:
+                                st.plotly_chart(
+                                    backtest_charts.build_outcome_breakdown(
+                                        swbt_result.trades, swbt_result.stats),
+                                    width="stretch", key="swbt_outcomes",
+                                )
+
+                                w1, w2, w3, w4 = st.columns(4)
+                                w1.metric("Win rate", f"{sm['win_rate']:.0%}")
+                                w2.metric("Profit factor", f"{sm['profit_factor']:.2f}")
+                                w3.metric("Median MAE", f"{sm['median_mae_r']:.2f} R")
+                                w4.metric("Max drawdown", f"{sm['max_drawdown']:.1%}")
+
+                                st.plotly_chart(
+                                    backtest_charts.build_r_multiple_distribution(swbt_result.trades),
+                                    width="stretch", key="swbt_rdist",
+                                )
+                                st.plotly_chart(
+                                    backtest_charts.build_mae_vs_outcome(swbt_result.trades),
+                                    width="stretch", key="swbt_mae",
+                                )
+                                st.caption(
+                                    f"Median trade went {sm['median_mae_r']:.2f}R against "
+                                    f"before resolving and reached {sm['median_mfe_r']:.2f}R "
+                                    "in favour. Winners bunched just inside the stop line "
+                                    "mean the stop is where trades routinely trade before "
+                                    "they work — tightening it would cut them off."
+                                )
+
+                                r_boot = swbt_report.get("r_bootstrap")
+                                if r_boot is not None:
+                                    st.plotly_chart(
+                                        backtest_charts.build_r_fan(
+                                            r_boot, swbt_result.trades["r_multiple"]),
+                                        width="stretch", key="swbt_rfan",
+                                    )
+                                    rs = r_boot.summary()
+                                    st.caption(
+                                        f"Resampling the trade order: median "
+                                        f"{rs['median_total_r']:+.1f}R, 5th–95th "
+                                        f"{rs['p05_total_r']:+.1f}R to "
+                                        f"{rs['p95_total_r']:+.1f}R. R accumulates rather "
+                                        "than compounds, because every trade is sized to the "
+                                        "same risk."
+                                    )
+
+                                random_swbt = swbt_report.get("random_entry")
+                                if random_swbt:
+                                    st.plotly_chart(
+                                        backtest_charts.build_random_entry_distribution(random_swbt),
+                                        width="stretch", key="swbt_random",
+                                    )
+                                    pct = random_swbt["percentile"]
+                                    if pct >= 90:
+                                        st.success(
+                                            f"The average trade beat {pct:.0f}% of random "
+                                            "entries held the same length — the setups are "
+                                            "doing work."
+                                        )
+                                    elif pct >= 60:
+                                        st.info(
+                                            f"The average trade beat {pct:.0f}% of random "
+                                            "entries. Weak evidence the setups add anything "
+                                            "beyond exposure."
+                                        )
+                                    else:
+                                        st.warning(
+                                            f"The average trade beat only {pct:.0f}% of "
+                                            "random entries of the same length. On this data "
+                                            "the setups are not outperforming being in the "
+                                            "market for the same time."
+                                        )
+
+                                if swbt_bound is not None:
+                                    spread = swbt_bound["spread"]
+                                    if spread <= 1e-9:
+                                        st.caption(
+                                            "No bar ever covered both the stop and a target, "
+                                            "so the intrabar tie-break changed nothing here."
+                                        )
+                                    else:
+                                        st.plotly_chart(
+                                            backtest_charts.build_ambiguity_bound(swbt_bound),
+                                            width="stretch", key="swbt_bound",
+                                        )
+                                        st.caption(
+                                            f"Return lands between "
+                                            f"{swbt_bound['return_low']:+.1%} and "
+                                            f"{swbt_bound['return_high']:+.1%} depending "
+                                            "purely on which barrier a daily bar hit first — "
+                                            f"{swbt_bound['ambiguous_share']:.0%} of trades "
+                                            "flipped. A wide gap means daily bars cannot "
+                                            "settle this strategy and it needs intraday data "
+                                            "before anyone trades it."
+                                        )
+
+                                with st.expander(f"Trade log ({len(swbt_result.trades)})"):
+                                    st.dataframe(swbt_result.trades, width="stretch",
+                                                 hide_index=True)
+                                    st.download_button(
+                                        "⬇️ Download swing trades as CSV",
+                                        swbt_result.trades.to_csv(index=False).encode("utf-8"),
+                                        file_name="swing_backtest_trades.csv",
+                                        mime="text/csv", key="swbt_dl",
+                                    )
 
                 rejects = swing_ctx.get("rejects") or {}
                 if rejects:

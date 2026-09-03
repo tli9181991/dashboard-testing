@@ -120,6 +120,50 @@ The causality contract is proved empirically in `tests/test_causality.py`: appen
 future bars must never change a decision already taken. If those tests fail, every
 number this repo produces is fiction.
 
+## 🎲 Simulation
+
+A single historical replay gives one number, and that number mixes the strategy,
+the order the trades happened to arrive in, and the stretch of history it ran
+through. `simulation.py` separates them:
+
+- **Bootstrap** — resamples the realised trades thousands of times and rebuilds the
+  equity curve, so you see the range of outcomes the same trades could have given.
+  A realised path near the edge of the fan owed much of its result to sequence luck.
+- **Random-entry benchmark** — replays the same number of trades with the same
+  holding periods but random entry dates in the same names. If the strategy's
+  average trade does not clear that distribution, the entry rule added nothing over
+  simply being in the market that long. This is the sharpest of the three tests.
+- **Buy and hold** — the honest floor. A strategy that only beats it by sitting in
+  cash through a drawdown has not demonstrated selection skill.
+
+The screener tab runs all three over the screened stocks. **Read the comparisons,
+not the absolute return**: names selected today for having trended are not a fair
+sample of what you could have picked back then, so absolute results from such a run
+are inflated. The comparisons survive because every leg inherits the same bias.
+
+### Backtesting the swing setups (tab 3)
+
+The swing setups are brackets, not a moving-average rule, so they get their own
+engine — `swing_backtest.py`, a triple-barrier replay:
+
+- Each setup's entry is placed as a **resting order** — a stop-buy above the market
+  for the momentum pullback, a limit-buy below it for the ICT setup — and cancelled
+  if it never trades. Typically half of all setups never become positions, and an
+  engine that assumes they all fill will report an edge that does not exist.
+- **Gap fills are modelled.** A stop-buy that gaps through its trigger fills at the
+  open, worse than the order; a limit-buy that gaps below fills better.
+- **TP1 takes a partial and moves the stop to breakeven**, as the setup's own design
+  intends; the remainder runs to TP2 or the time stop.
+- **The intrabar unknown is reported as a range.** When one daily bar covers both the
+  stop and a target, OHLC cannot say which came first, so the tab runs both
+  resolutions. A wide gap between them means daily bars cannot settle the strategy
+  and it needs intraday data before it is traded.
+- **MAE and MFE are recorded in R** for every trade, which is what tells you whether
+  the stops sit where the trades actually need them.
+
+R multiples *add* rather than compound — every trade is sized to the same risk — so
+the resampled fan for these setups is a running sum, not a product.
+
 ## 🛡️ Risk Controls
 
 **Volatility-targeted sizing** replaces the old fixed six-share position:
