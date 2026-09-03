@@ -9,12 +9,15 @@ from datetime import datetime
 from config import (
     ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
     USE_REGIME_GATE, REGIME_BENCHMARK,
-    SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT
+    SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SENTIMENT, SHOW_TAB_CHATBOT,
+    CHAT_HISTORY_DIR
 )
 import data as data_mod
 from breakout import SwingBreakoutMonitor
 from positions import load_portfolio, conversion_notes
 from sizing import SizingParams
+from strategy import StrategyParams, add_indicators
+from chat_history import ChatHistoryStore, make_message
 from sentiment import get_hourly_sentiment
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
@@ -22,19 +25,68 @@ from chat_agent import get_financial_agent
 # =============================================================================
 # Helper Functions
 # =============================================================================
+# EMAs for the screener charts come from the same helper the strategy uses, so a
+# line on a chart always means what the signal engine means by it.
+SCREENER_CHART_PARAMS = StrategyParams(ema_spans=(5, 10, 20))
+SCREENER_EMA_STYLE = {
+    "EMA_5": ("5 EMA", "#00F0FF", 1),
+    "EMA_10": ("10 EMA", "#FF00FF", 1),
+    "EMA_20": ("20 EMA", "#00FF00", 1.5),
+}
+
+
 @st.cache_data(ttl=3600)
-def fetch_normalized_sector_prices(tickers: list) -> pd.DataFrame:
-    if not tickers: return pd.DataFrame()
-    hist = yf.download(tickers, period="6mo", interval="1d", progress=False)
-    
-    if isinstance(hist.columns, pd.MultiIndex):
-        closes = hist["Close"]
-    else:
-        closes = pd.DataFrame({tickers[0]: hist["Close"]})
-    
-    closes.dropna(inplace=True)
-    if closes.empty: return pd.DataFrame()
-    return (closes / closes.iloc[0] - 1) * 100
+def fetch_sector_price_history(tickers: tuple, period: str = "6mo") -> dict:
+    """Per-ticker OHLCV with EMA overlays, keyed by symbol.
+
+    Prices are left in their own units — each stock gets its own axis, so there is
+    nothing to normalise against.
+    """
+    if not tickers:
+        return {}
+
+    raw = yf.download(list(tickers), period=period, interval="1d", progress=False,
+                      group_by="ticker", auto_adjust=True)
+    if raw is None or raw.empty:
+        return {}
+
+    out = {}
+    for ticker in tickers:
+        try:
+            sub = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) else raw
+            sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            if sub.empty:
+                continue
+            out[ticker] = add_indicators(sub, SCREENER_CHART_PARAMS)
+        except Exception:
+            continue
+    return out
+
+
+def render_price_chart(ticker: str, df: pd.DataFrame, height: int = 360):
+    """Candlestick with 5/10/20 EMA overlays, on the stock's own price scale."""
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        name=ticker, showlegend=False,
+    ))
+    for column, (label, colour, width) in SCREENER_EMA_STYLE.items():
+        if column in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[column], mode="lines", name=label,
+                line=dict(color=colour, width=width),
+            ))
+
+    last_close = float(df["Close"].iloc[-1])
+    fig.update_layout(
+        title=f"{ticker} — ${last_close:,.2f}",
+        template="plotly_dark", height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1.0),
+        xaxis=dict(rangeslider=dict(visible=False), type="date"),
+        yaxis=dict(title="Price ($)"),
+    )
+    return fig
 
 # =============================================================================
 # Dashboard Initialization
@@ -185,8 +237,7 @@ if SHOW_TAB_BREAKOUT:
                     rangeslider=dict(visible=False), type="date"
                 )
             )
-            # st.plotly_chart correctly uses use_container_width
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
         with col2:
             st.subheader(f"Execution Stream: {chart_ticker}")
@@ -224,19 +275,23 @@ if SHOW_TAB_SCREENER:
                 
                 tickers = sector_df["ticker"].tolist()
                 if tickers:
-                    with st.expander(f"View {sector_name} Relative Performance Chart (6 Months)"):
-                        sec_prices = fetch_normalized_sector_prices(tickers)
-                        if not sec_prices.empty:
-                            fig_sec = go.Figure()
-                            for t in tickers:
-                                if t in sec_prices.columns:
-                                    fig_sec.add_trace(go.Scatter(x=sec_prices.index, y=sec_prices[t], mode='lines', name=t))
-                            fig_sec.update_layout(
-                                title=f"{sector_name} Top 5 - 6 Month Relative Return (%)",
-                                template="plotly_dark", height=400,
-                                xaxis_title="Date", yaxis_title="Performance (%)"
-                            )
-                            st.plotly_chart(fig_sec, use_container_width=True)
+                    with st.expander(f"View {sector_name} Price Charts (6 Months, 5/10/20 EMA)"):
+                        history = fetch_sector_price_history(tuple(tickers))
+                        if not history:
+                            st.caption("No price data available for this sector right now.")
+                        else:
+                            chart_cols = st.columns(2)
+                            for n, ticker in enumerate(tickers):
+                                with chart_cols[n % 2]:
+                                    frame = history.get(ticker)
+                                    if frame is None or frame.empty:
+                                        st.caption(f"No price data for {ticker}.")
+                                        continue
+                                    st.plotly_chart(
+                                        render_price_chart(ticker, frame),
+                                        width="stretch",
+                                        key=f"screener_{sector_name}_{ticker}",
+                                    )
                 st.markdown("---")
             
         if st.button("Run Fresh Full Stock Rescan (Warning: Takes ~3-5 mins)"):
@@ -267,69 +322,99 @@ if SHOW_TAB_SENTIMENT:
 # TAB 4: LangChain AI Financial Assistant
 if SHOW_TAB_CHATBOT:
     with rendered_tabs[tab_index]:
+        chat_store = ChatHistoryStore(CHAT_HISTORY_DIR)
+
+        def _open_conversation(conversation):
+            """Point session state — and the picker widget — at one conversation."""
+            st.session_state.conversation_id = conversation.id
+            st.session_state.messages = conversation.messages
+            # A keyed widget's stored value wins over its `index` argument, so the
+            # picker has to be moved explicitly or it snaps back to the old thread.
+            st.session_state.conversation_picker = conversation.id
+
+        # Reopen whatever conversation was last in use. session_state is in-memory
+        # only, so without this every restart started from a blank thread.
+        if "conversation_id" not in st.session_state:
+            _open_conversation(chat_store.load_current_or_create())
+
         c1, c2 = st.columns([8, 2])
         with c1:
             st.subheader("💬 AI Financial Assistant")
             st.markdown("Ask me to analyze stocks, search the news, or give suggestions based on technicals!")
         with c2:
-            if st.button("🗑️ Clear Memory"):
-                st.session_state.messages = []
-                st.session_state.chat_history = []
+            if st.button("🗑️ Clear Chat History", width="stretch"):
+                # Archive the current thread and open a fresh one. Nothing is
+                # deleted — the old conversation stays on disk and in the picker.
+                current = chat_store.load(st.session_state.conversation_id)
+                _open_conversation(chat_store.start_new(current))
                 st.rerun()
-        
-        # Initialize UI Chat History
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-            
-        # Initialize LangChain Memory State
-        if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
 
-        # Render UI Chat History
+        conversations = chat_store.list_conversations()
+        if len(conversations) > 1:
+            ids = [c.id for c in conversations]
+            labels = {c.id: c.label() for c in conversations}
+            try:
+                position = ids.index(st.session_state.conversation_id)
+            except ValueError:
+                position = 0
+            chosen = st.selectbox(
+                "Conversation", ids, index=position,
+                format_func=lambda i: labels.get(i, i), key="conversation_picker",
+            )
+            if chosen != st.session_state.conversation_id:
+                selected = chat_store.load(chosen)
+                if selected is not None:
+                    chat_store.set_current(selected.id)
+                    _open_conversation(selected)
+                    st.rerun()
+
+        st.caption(f"{len(st.session_state.messages)} messages · saved to `{CHAT_HISTORY_DIR}`")
+
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        # Chat Input logic
         if prompt := st.chat_input("E.g., 'What is the latest news on NVDA and should I buy it?'"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
+            # The agent needs the exchanges *before* this prompt, so capture the
+            # history first and append afterwards.
+            prior = list(st.session_state.messages)
+            st.session_state.messages.append(make_message("user", prompt))
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
                 with st.spinner("Agent is researching and thinking..."):
-                    # FIXED: Called with NO arguments.
-                    agent = get_financial_agent() 
+                    agent = get_financial_agent()
                     if not agent:
                         response = "⚠️ Please ensure AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL are configured in your .env file."
                     else:
                         try:
                             from langchain_core.messages import HumanMessage, AIMessage
-                            
-                            # Format memory for LangChain
-                            formatted_history = []
-                            for msg in st.session_state.chat_history:
-                                if msg["role"] == "user":
-                                    formatted_history.append(HumanMessage(content=msg["content"]))
-                                else:
-                                    formatted_history.append(AIMessage(content=msg["content"]))
 
+                            formatted_history = [
+                                HumanMessage(content=m["content"]) if m["role"] == "user"
+                                else AIMessage(content=m["content"])
+                                for m in prior
+                            ]
                             result = agent.invoke({
                                 "input": prompt,
-                                "chat_history": formatted_history
+                                "chat_history": formatted_history,
                             })
                             response = result["output"]
                         except Exception as e:
                             response = f"Agent encountered an error: {str(e)}"
-                    
+
                     st.markdown(response)
-            
-            # Save to UI memory
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            
-            # Save to LangChain memory
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
+
+            st.session_state.messages.append(make_message("assistant", response))
+
+            # Persist immediately so a crash or restart cannot lose the exchange.
+            conversation = chat_store.load(st.session_state.conversation_id)
+            if conversation is None:
+                conversation = chat_store.create()
+                st.session_state.conversation_id = conversation.id
+            conversation.messages = st.session_state.messages
+            chat_store.save(conversation)
 
 if not auto_refresh_paused:
     time.sleep(refresh_rate)
