@@ -124,6 +124,80 @@ def bootstrap_paths(
     return PathResult(paths, params)
 
 
+@dataclass
+class RPathResult:
+    """Cumulative R across resampled trade orders, shape (n_paths, n_trades + 1).
+
+    R multiples add rather than compound — every trade is sized to the same risk by
+    construction — so these paths accumulate, they do not multiply.
+    """
+
+    paths: np.ndarray
+    params: SimulationParams
+
+    @property
+    def finals(self) -> np.ndarray:
+        return self.paths[:, -1]
+
+    def percentile_band(self, lower: float, upper: float) -> tuple[np.ndarray, np.ndarray]:
+        return (np.percentile(self.paths, lower, axis=0),
+                np.percentile(self.paths, upper, axis=0))
+
+    @property
+    def median_path(self) -> np.ndarray:
+        return np.percentile(self.paths, 50, axis=0)
+
+    def summary(self) -> dict:
+        finals = self.finals
+        running_max = np.maximum.accumulate(self.paths, axis=1)
+        drawdowns = (self.paths - running_max).min(axis=1)
+        return {
+            "n_paths": int(self.paths.shape[0]),
+            "n_trades": int(self.paths.shape[1] - 1),
+            "median_total_r": float(np.median(finals)),
+            "p05_total_r": float(np.percentile(finals, 5)),
+            "p95_total_r": float(np.percentile(finals, 95)),
+            "prob_profit": float((finals > 0).mean()),
+            "median_max_drawdown_r": float(np.median(drawdowns)),
+            "worst_max_drawdown_r": float(drawdowns.min()),
+        }
+
+
+def bootstrap_r_paths(
+    r_multiples,
+    params: SimulationParams = SimulationParams(),
+    n_trades: Optional[int] = None,
+) -> Optional[RPathResult]:
+    """Resample R multiples additively.
+
+    Compounding them would be wrong: a bracket strategy risks a fixed fraction on
+    every trade, so twenty 1R wins is +20R, not 1.01**20.
+    """
+    values = np.asarray(pd.Series(r_multiples).dropna(), dtype=float)
+    if values.size < 2:
+        return None
+
+    n_trades = int(n_trades or values.size)
+    if n_trades < 1:
+        return None
+
+    rng = np.random.default_rng(params.seed)
+    block = max(1, int(params.block_size))
+
+    if block == 1:
+        draws = rng.choice(values, size=(params.n_paths, n_trades), replace=True)
+    else:
+        n_blocks = math.ceil(n_trades / block)
+        starts = rng.integers(0, values.size, size=(params.n_paths, n_blocks))
+        offsets = np.arange(block)
+        idx = (starts[:, :, None] + offsets[None, None, :]) % values.size
+        draws = values[idx].reshape(params.n_paths, -1)[:, :n_trades]
+
+    cumulative = np.cumsum(draws, axis=1)
+    paths = np.hstack([np.zeros((params.n_paths, 1)), cumulative])
+    return RPathResult(paths, params)
+
+
 def buy_and_hold(price_data: dict[str, pd.DataFrame]) -> dict:
     """Equal-weight buy and hold across the same names, over the same window."""
     if not price_data:

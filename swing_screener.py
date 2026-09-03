@@ -194,11 +194,17 @@ def prior_period_levels(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def is_displacement(df: pd.DataFrame, i: int, cfg: dict) -> bool:
-    """§04B energetic one-directional delivery: range, body and an FVG."""
+def is_displacement(df: pd.DataFrame, i: int, cfg: dict,
+                    atr20: pd.Series | None = None) -> bool:
+    """§04B energetic one-directional delivery: range, body and an FVG.
+
+    ``atr20`` may be passed in when scanning many bars of one frame; recomputing
+    it per candidate bar makes a backtest quadratic. Omitted, it is computed here
+    exactly as before.
+    """
     if i < 2:
         return False
-    a = atr(df, 20).iloc[i]
+    a = (atr(df, 20) if atr20 is None else atr20).iloc[i]
     if np.isnan(a) or a == 0:
         return False
     rng = df["High"].iloc[i] - df["Low"].iloc[i]
@@ -446,7 +452,8 @@ def momentum_setup(df: pd.DataFrame, cfg: dict) -> dict | None:
 # §04B  The 2022 model on daily bars
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ict_setup(df: pd.DataFrame, cfg: dict) -> dict | None:
+def ict_setup(df: pd.DataFrame, cfg: dict,
+              levels: pd.DataFrame | None = None) -> dict | None:
     """
     sweep sell-side → displacement MSS through the last confirmed swing high →
     entry in the FVG the displacement left → draw to the opposing pool.
@@ -462,8 +469,12 @@ def ict_setup(df: pd.DataFrame, cfg: dict) -> dict | None:
     a = float(a14.iloc[-1])
     if np.isnan(a) or a <= 0:
         return None
+    a20 = atr(df, 20)          # computed once; the MSS scan below reuses it
 
-    lv = prior_period_levels(df)
+    # Levels come from COMPLETED prior weeks and months, so one computed over a
+    # longer history and sliced to this window is identical to computing it here.
+    # A backtest precomputes it once per symbol; live callers omit it.
+    lv = prior_period_levels(df) if levels is None else levels.reindex(df.index)
     sh, _ = swing_points(df)                       # already lagged by one bar
     t = n - 1                                      # last completed bar
 
@@ -503,7 +514,7 @@ def ict_setup(df: pd.DataFrame, cfg: dict) -> dict | None:
         if not highs:
             continue
         ref = max(highs)
-        if float(df["Close"].iloc[k]) > ref and is_displacement(df, k, cfg):
+        if float(df["Close"].iloc[k]) > ref and is_displacement(df, k, cfg, a20):
             mss = {"k": k, "ref": ref}
             break
     if mss is None:

@@ -200,3 +200,109 @@ def test_swing_charts_and_backtest_charts_share_one_theme():
     import swing_charts
     assert swing_charts.SURFACE is viz.SURFACE
     assert swing_charts.CATEGORICAL is viz.CATEGORICAL
+
+
+# ---------------------------------------------------------------------------
+# Swing / bracket-strategy charts
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def swing_scenario():
+    import swing_backtest as sb
+    import swing_screener as ss
+
+    bars = ss.load_demo(n_names=4, seed=11)
+    spy = bars.pop("SPY")
+    config = sb.SwingBacktestConfig(warmup=430)
+    result = sb.run_swing_backtest(bars, spy, dict(ss.CFG), config)
+    if result.trades.empty:
+        pytest.skip("swing run produced no trades")
+    return result, bars, spy, config
+
+
+def test_order_funnel_narrows_from_setups_to_fills(swing_scenario):
+    result, *_ = swing_scenario
+    fig = charts.build_order_funnel(result.stats, len(result.trades))
+    counts = list(fig.data[0].x)
+    assert counts == sorted(counts), "the funnel is drawn bottom-up and cannot widen"
+
+
+def test_outcome_breakdown_counts_unfilled_orders_from_the_stats(swing_scenario):
+    """An unfilled order is not a trade, so it cannot come from the trade table."""
+    result, *_ = swing_scenario
+    fig = charts.build_outcome_breakdown(result.trades, result.stats)
+    labels = list(fig.data[0].y)
+    values = dict(zip(labels, fig.data[0].x))
+    assert "Never filled" in labels
+    assert values["Never filled"] == result.stats["orders_expired"]
+
+
+def test_outcome_breakdown_uses_the_engines_exit_reasons(swing_scenario):
+    result, *_ = swing_scenario
+    keys = {k for k, _ in charts.OUTCOME_ORDER if not k.startswith("__")}
+    assert set(result.trades["exit_reason"]) <= keys
+
+
+def test_outcome_breakdown_without_stats_omits_the_unfilled_row(swing_scenario):
+    result, *_ = swing_scenario
+    fig = charts.build_outcome_breakdown(result.trades)
+    assert "Never filled" not in list(fig.data[0].y)
+
+
+def test_r_distribution_splits_at_zero_and_marks_expectancy(swing_scenario):
+    result, *_ = swing_scenario
+    fig = charts.build_r_multiple_distribution(result.trades)
+    names = [t.name for t in fig.data]
+    assert set(names) <= {"Losses", "Wins"}
+    labels = " ".join(a.text for a in fig.layout.annotations if a.text)
+    assert "Expectancy" in labels
+
+
+def test_r_fan_accumulates_rather_than_compounds(swing_scenario):
+    """R is additive: twenty 1R wins is +20R, not 1.01**20."""
+    import simulation as sim
+    result, *_ = swing_scenario
+    paths = sim.bootstrap_r_paths(result.trades["r_multiple"],
+                                  sim.SimulationParams(n_paths=100, seed=3))
+    fig = charts.build_r_fan(paths, result.trades["r_multiple"])
+    realised = [t for t in fig.data if t.name == "Realised"][0]
+    expected = float(result.trades["r_multiple"].sum())
+    assert float(realised.y[-1]) == pytest.approx(expected, abs=1e-9)
+    assert float(realised.y[0]) == pytest.approx(0.0)
+
+
+def test_mae_chart_marks_the_stop_distance(swing_scenario):
+    result, *_ = swing_scenario
+    fig = charts.build_mae_vs_outcome(result.trades)
+    labels = " ".join(a.text for a in fig.layout.annotations if a.text)
+    assert "stop distance" in labels
+    assert len(fig.data[0].x) == len(result.trades)
+
+
+def test_ambiguity_chart_shows_both_resolutions(swing_scenario):
+    import swing_backtest as sb
+    import swing_screener as ss
+    _, bars, spy, config = swing_scenario
+    bound = sb.ambiguity_bound(bars, spy, dict(ss.CFG), config)
+    fig = charts.build_ambiguity_bound(bound)
+    names = [t.name for t in fig.data]
+    assert any("optimistic" in n for n in names)
+    assert any("pessimistic" in n for n in names)
+
+
+def test_swing_charts_share_the_theme(swing_scenario):
+    import simulation as sim
+    result, bars, spy, config = swing_scenario
+    paths = sim.bootstrap_r_paths(result.trades["r_multiple"],
+                                  sim.SimulationParams(n_paths=80, seed=3))
+    figures = [
+        charts.build_order_funnel(result.stats, len(result.trades)),
+        charts.build_outcome_breakdown(result.trades, result.stats),
+        charts.build_r_multiple_distribution(result.trades),
+        charts.build_r_fan(paths, result.trades["r_multiple"]),
+        charts.build_mae_vs_outcome(result.trades),
+    ]
+    for fig in figures:
+        assert fig.layout.paper_bgcolor == viz.SURFACE
+        assert fig.layout.xaxis.griddash == "solid"
+        assert "yaxis2" not in fig.layout
