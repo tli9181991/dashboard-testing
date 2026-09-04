@@ -22,7 +22,7 @@ DEFAULT_MAX_POS = int(os.getenv("MAX_POS", "5"))
 # Feature Flags (UI Tabs)
 SHOW_TAB_BREAKOUT = parse_bool(os.getenv("SHOW_TAB_BREAKOUT"), True)
 SHOW_TAB_SCREENER = parse_bool(os.getenv("SHOW_TAB_SCREENER"), True)
-SHOW_TAB_SENTIMENT = parse_bool(os.getenv("SHOW_TAB_SENTIMENT"), True)
+SHOW_TAB_SENTIMENT = parse_bool(os.getenv("SHOW_TAB_SENTIMENT"), False)
 # app.py has always imported SHOW_TAB_CHATBOT; only SHOW_TAB_PORTFOLIO was defined,
 # so importing app.py raised ImportError before this was added.
 SHOW_TAB_SWING = parse_bool(os.getenv("SHOW_TAB_SWING"), True)
