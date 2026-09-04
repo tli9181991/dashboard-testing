@@ -97,6 +97,46 @@ def get_financial_agent():
         result plainly rather than softening it."""
         return agent_tools.render_random_entry(agent_tools.random_entry_test(ticker))
 
+    # ── The app's own trading strategies ─────────────────────────────────────
+
+    @tool
+    def check_swing_setups(ticker: str, equity: float = 100000.0) -> str:
+        """Run the two Swing Universe Funnel setups on this ticker's latest closed
+        bar: the §04A momentum-pullback continuation and the §04B ICT model. Returns
+        a complete bracket for each that fired — entry, stop, TP1, TP2, R multiples
+        and position size — or reports that neither fired. Use this whenever asked
+        about a swing trade, and report "no setup" as the normal answer it is."""
+        return agent_tools.render_swing_setups(
+            agent_tools.check_swing_setups(ticker, equity=equity))
+
+    @tool
+    def screen_symbol(ticker: str) -> str:
+        """Check whether a ticker passes the funnel's filters before any setup is
+        considered: §01 liquidity, §02 tradability (ADR band, efficiency ratio, gap
+        risk, volatility regime), the Stage-2 trend template, and relative strength
+        against the market. A name that fails here is not tradeable by this system
+        however good the chart looks."""
+        return agent_tools.render_screen(agent_tools.screen_symbol(ticker))
+
+    @tool
+    def backtest_strategy(ticker: str, strategy: str = "breakout") -> str:
+        """Replay one of the app's strategies over this ticker's history and report
+        its metrics against buy and hold. `strategy` is "breakout" for the
+        moving-average rule or "swing" for the triple-barrier replay of the two
+        swing setups. The swing replay is slow — tens of seconds — so only run it
+        when the swing strategy is specifically in question."""
+        return agent_tools.render_backtest(
+            agent_tools.backtest_strategy(ticker, strategy=strategy))
+
+    @tool
+    def scan_watchlist(strategy: str = "breakout") -> str:
+        """Run a strategy across every symbol in the watchlist and portfolio and
+        list what fired. `strategy` is "breakout" for the moving-average rule's
+        BUY/SELL signals or "swing" for live setup brackets. This is the only tool
+        that sees across symbols, so use it for "what should I look at today"
+        rather than asking about names one at a time."""
+        return agent_tools.render_scan(agent_tools.scan_watchlist(strategy=strategy))
+
     search_tool = DuckDuckGoSearchRun()
     
     @tool
@@ -109,6 +149,7 @@ def get_financial_agent():
         get_stock_fundamentals, get_historical_performance, web_news_search,
         check_earnings, validate_trade_plan, check_signal_now,
         get_support_resistance, size_position, random_entry_test,
+        check_swing_setups, screen_symbol, backtest_strategy, scan_watchlist,
     ]
     llm = AzureAIChatCompletionsModel(
         endpoint=AZURE_INFERENCE_ENDPOINT,
@@ -123,9 +164,15 @@ def get_financial_agent():
         "Always rely on the tools for up-to-date information.\n\n"
         "Several tools compute over this dashboard's own tested engines: "
         "check_signal_now, get_support_resistance, size_position, check_earnings, "
-        "validate_trade_plan and random_entry_test. Prefer them over your own "
-        "arithmetic or recollection — never estimate a signal, a level, a position "
-        "size or a backtest result yourself when a tool will compute it.\n\n"
+        "validate_trade_plan, random_entry_test, check_swing_setups, screen_symbol, "
+        "backtest_strategy and scan_watchlist. Prefer them over your own arithmetic "
+        "or recollection — never estimate a signal, a level, a position size, a "
+        "setup or a backtest result yourself when a tool will compute it.\n\n"
+        "This app runs two strategies: a moving-average breakout rule, and a swing "
+        "funnel with two setups (§04A momentum pullback, §04B ICT). When a question "
+        "is about swing trading use check_swing_setups; when it is about whether a "
+        "name is worth trading at all use screen_symbol first. 'No setup today' is "
+        "the normal answer and must not be softened into a weak signal.\n\n"
         "Before endorsing a concrete trade, run validate_trade_plan and check_earnings. "
         "If either fails, say so plainly and do not recommend the trade: refusing is a "
         "legitimate and useful answer. If random_entry_test shows the rule does not "

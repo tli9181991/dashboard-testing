@@ -391,3 +391,191 @@ def test_the_agent_exposes_every_computing_tool():
     expected = {"check_earnings", "validate_trade_plan", "check_signal_now",
                 "get_support_resistance", "size_position", "random_entry_test"}
     assert expected <= registered, sorted(expected - registered)
+
+
+# ---------------------------------------------------------------------------
+# The app's strategies as tools
+# ---------------------------------------------------------------------------
+
+def _uptrend_with_pullback(n=320, base=100.0, daily=0.0015, noise=0.0016,
+                           pull_len=3, seed=5):
+    """The purpose-built §04A fixture: trend, quiet pullback, up-close trigger."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end=pd.Timestamp("2026-06-30"), periods=n)
+    close = base * np.exp(np.cumsum(rng.normal(daily, noise, n)))
+    peak = close[-(pull_len + 2)]
+    for k in range(pull_len):
+        close[-(pull_len + 1) + k] = peak * (1 - 0.0035 * (k + 1))
+    close[-1] = close[-2] * 1.010
+
+    openp = np.concatenate([[close[0]], close[:-1]])
+    spread = close * 0.004
+    high = np.maximum(openp, close) + spread
+    low = np.minimum(openp, close) - spread
+    for k in range(pull_len):
+        j = -(pull_len + 1) + k
+        mid, half = (high[j] + low[j]) / 2, (high[j] - low[j]) / 2 * (0.85 ** (k + 1))
+        high[j], low[j] = mid + half, mid - half
+
+    vol = np.full(n, 3_000_000.0)
+    vol[-(pull_len + 1):-1] = 900_000.0
+    return pd.DataFrame({"Open": openp, "High": high, "Low": low,
+                         "Close": close, "Volume": vol}, index=idx)
+
+
+@pytest.fixture
+def trending(monkeypatch):
+    frame = _uptrend_with_pullback()
+    bench = data_mod.synthetic_ohlcv(n=len(frame), seed=5, annual_vol=0.16,
+                                     annual_drift=0.10)
+    bench.index = frame.index
+    monkeypatch.setattr(
+        at.data_mod, "load_history",
+        lambda s, period="3y", **k: bench if s in ("^GSPC", "SPY") else frame)
+    return frame
+
+
+def test_a_firing_setup_comes_back_as_a_complete_bracket(trending):
+    info = at.check_swing_setups("TREND")
+    assert info["error"] == ""
+    assert info["setups"], "the fixture is built to fire §04A"
+    for setup in info["setups"]:
+        assert setup["stop"] < setup["entry"] <= setup["tp1"] <= setup["tp2"]
+        assert setup["r_to_tp2"] > setup["r_to_tp1"] or setup["r_to_tp1"] == 0
+        assert setup["order_type"]
+
+
+def test_the_two_variants_rest_on_opposite_sides_of_the_market(trending):
+    for setup in at.check_swing_setups("TREND")["setups"]:
+        if setup["variant"].startswith("A"):
+            assert "stop-buy above" in setup["order_type"]
+        else:
+            assert "limit-buy below" in setup["order_type"]
+
+
+def test_no_setup_is_reported_as_the_normal_answer(loaded):
+    """A random walk rarely fires either setup; that must not read as a weak signal."""
+    text = at.render_swing_setups(at.check_swing_setups("TEST"))
+    if "neither" in text:
+        assert "normal answer" in text
+        assert "weak signal" in text
+
+
+def test_a_zero_size_explains_which_rule_zeroed_it(trending):
+    """Regression: a risk-off regime zeroes the size, and an unexplained
+    "Size 0 shares" reads as a broken number rather than a closed long side."""
+    info = at.check_swing_setups("TREND")
+    text = at.render_swing_setups(info)
+    zero = [s for s in info["setups"] if s["shares"] < 1]
+    if zero:
+        assert "Size 0" in text
+        assert ("regime layer allows no new long risk" in text
+                or "stop is too wide" in text)
+
+
+def test_setups_need_enough_history_for_the_trend_template(monkeypatch):
+    short = data_mod.synthetic_ohlcv(n=120, seed=3)
+    monkeypatch.setattr(at.data_mod, "load_history", lambda *a, **k: short)
+    info = at.check_swing_setups("SHORT")
+    assert "252" in info["error"]
+
+
+def test_the_screen_reports_each_filter_separately(loaded):
+    info = at.screen_symbol("TEST")
+    assert info["error"] == ""
+    assert isinstance(info["liquidity_pass"], bool)
+    assert isinstance(info["stage2_trend_template"], bool)
+    assert set(info["tradability"]) >= {"adr_pct", "efficiency_ratio", "gap_score",
+                                        "vol_regime", "passes_floor"}
+
+
+def test_a_failed_liquidity_gate_stops_the_screen_there(monkeypatch):
+    """Nothing downstream matters if the name cannot be traded at size."""
+    thin = data_mod.synthetic_ohlcv(n=400, seed=3)
+    thin["Volume"] = 100.0
+    monkeypatch.setattr(at.data_mod, "load_history", lambda *a, **k: thin)
+    info = at.screen_symbol("THIN")
+    assert info["liquidity_pass"] is False
+    text = at.render_screen(info)
+    assert "FAILS the §01 liquidity gate" in text
+    assert "cannot trade it" in text
+
+
+def test_the_screen_reports_relative_strength_against_the_market(trending):
+    info = at.screen_symbol("TREND")
+    assert info["rs_126d_vs_market"] is not None
+    assert "relative strength" in at.render_screen(info)
+
+
+def test_the_trend_template_passes_on_a_clean_uptrend(trending):
+    assert at.screen_symbol("TREND")["stage2_trend_template"] is True
+
+
+@pytest.mark.parametrize("strategy", ["breakout", "swing"])
+def test_each_strategy_can_be_backtested_by_name(loaded, strategy):
+    info = at.backtest_strategy("TEST", strategy=strategy)
+    assert info["error"] == ""
+    assert info["strategy"] == strategy
+    assert "n_trades" in info["metrics"]
+    assert "characterisation, not an edge estimate" in at.render_backtest(info)
+
+
+def test_the_swing_backtest_reports_the_fill_rate(loaded):
+    """Orders that never traded are the number that separates this from a
+    backtest that assumes every setup becomes a position."""
+    info = at.backtest_strategy("TEST", strategy="swing")
+    assert {"setups_seen", "orders_placed", "orders_expired", "fill_rate"} \
+        <= set(info["metrics"])
+
+
+def test_the_backtest_compares_against_buy_and_hold(loaded):
+    info = at.backtest_strategy("TEST", strategy="breakout")
+    assert info["buy_and_hold_return"] is not None
+    assert "Buy and hold" in at.render_backtest(info)
+
+
+def test_an_unknown_strategy_name_is_refused(loaded):
+    info = at.backtest_strategy("TEST", strategy="martingale")
+    assert "Unknown strategy" in info["error"]
+
+
+def test_the_scan_lists_what_fired_across_the_watchlist(loaded, monkeypatch, tmp_path):
+    import config as app_config
+    import watchlist as watchlist_mod
+
+    store = watchlist_mod.WatchlistStore(tmp_path / "watchlist.json")
+    for symbol in ("AAA", "BBB"):
+        store.add(symbol)
+    monkeypatch.setattr(app_config, "WATCHLIST_FILE", tmp_path / "watchlist.json")
+
+    info = at.scan_watchlist("breakout")
+    assert info["error"] == ""
+    assert info["scanned"] == 2
+    assert len(info["hits"]) + len(info["quiet"]) + len(info["failed"]) == 2
+
+
+def test_an_empty_watchlist_says_so(monkeypatch, tmp_path):
+    import config as app_config
+    monkeypatch.setattr(app_config, "WATCHLIST_FILE", tmp_path / "empty.json")
+    info = at.scan_watchlist("breakout")
+    assert "empty" in info["error"]
+
+
+def test_the_scan_refuses_an_unknown_strategy():
+    assert "Unknown strategy" in at.scan_watchlist("astrology")["error"]
+
+
+def test_the_agent_exposes_every_strategy_tool():
+    import ast
+
+    tree = ast.parse(open("chat_agent.py").read())
+    registered = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and any(getattr(d, "id", "") == "tool" for d in node.decorator_list)
+    }
+    expected = {"check_swing_setups", "screen_symbol", "backtest_strategy",
+                "scan_watchlist"}
+    assert expected <= registered, sorted(expected - registered)
