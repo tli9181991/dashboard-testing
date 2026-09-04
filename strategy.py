@@ -241,7 +241,7 @@ def drop_forming_bar(df: pd.DataFrame, asset_class: AssetClass, now: Optional[pd
     """
     if df.empty:
         return df
-    now = pd.Timestamp.utcnow().tz_localize(None) if now is None else pd.Timestamp(now)
+    now = pd.Timestamp.now("UTC").tz_localize(None) if now is None else pd.Timestamp(now)
     last = pd.Timestamp(df.index[-1])
     if getattr(last, "tzinfo", None) is not None:
         last = last.tz_localize(None)

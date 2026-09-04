@@ -6,6 +6,7 @@ from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 
 from config import AZURE_INFERENCE_ENDPOINT, AZURE_INFERENCE_CREDENTIAL, DEEPSEEK_MODEL_NAME
+import agent_tools
 
 def get_financial_agent():
     """Initializes a native LangChain tool-calling agent with memory, backed by
@@ -39,6 +40,63 @@ def get_financial_agent():
         except Exception as e:
             return f"Error fetching history for {ticker}: {str(e)}"
 
+    # ── Tools that COMPUTE, over the app's own tested engines ────────────────
+    # These are what let the model check a claim instead of composing one. Each
+    # wraps machinery with tests behind it and can answer "I don't know".
+
+    @tool
+    def check_earnings(ticker: str) -> str:
+        """Next scheduled earnings date and whether opening a swing position today
+        falls inside its blackout window. Check this BEFORE recommending any swing
+        entry — a trade held through earnings is a gap risk no stop can control."""
+        return agent_tools.render_earnings(agent_tools.earnings_calendar(ticker))
+
+    @tool
+    def validate_trade_plan(ticker: str, entry: float, stop: float,
+                            target: float = 0.0, equity: float = 100000.0) -> str:
+        """Check a proposed LONG trade against the account's risk rules: stop below
+        entry, stop inside the ATR budget, reward:risk at least 2R, position within
+        the size cap, and no earnings blackout. Returns PASS or FAIL with the
+        specific rule broken. Use this before endorsing any concrete trade, and
+        report a FAIL as a refusal rather than talking around it."""
+        result = agent_tools.validate_trade_plan(
+            ticker, entry=entry, stop=stop,
+            target=target if target else None, equity=equity)
+        return agent_tools.render_validation(result)
+
+    @tool
+    def check_signal_now(ticker: str) -> str:
+        """What the dashboard's own breakout engine says about this ticker on the
+        last CLOSED bar: BUY, SELL or HOLD, with the price, 10 SMA, ATR, market
+        regime and the engine's own reasoning. Use this instead of inferring a
+        signal from price data yourself."""
+        return agent_tools.render_signal(agent_tools.check_signal_now(ticker))
+
+    @tool
+    def get_support_resistance(ticker: str) -> str:
+        """Confirmed support and resistance levels with their distance from the
+        current price and how many times each was touched. These are the same
+        levels the breakout entry rule compares against."""
+        return agent_tools.render_levels(agent_tools.support_resistance(ticker))
+
+    @tool
+    def size_position(ticker: str, equity: float = 100000.0,
+                      target_vol: float = 0.15) -> str:
+        """How many units to buy under volatility targeting, and what fraction of
+        equity that is. Use this to turn "should I buy" into a specific size —
+        never estimate a position size yourself."""
+        return agent_tools.render_size(
+            agent_tools.size_position(ticker, equity=equity, target_vol=target_vol))
+
+    @tool
+    def random_entry_test(ticker: str) -> str:
+        """Backtest the breakout rule on this ticker and test whether its average
+        trade beats entering at RANDOM for the same holding periods. A low
+        percentile means the rule adds nothing over simply being in the market.
+        Use this when asked whether a strategy actually works, and report a poor
+        result plainly rather than softening it."""
+        return agent_tools.render_random_entry(agent_tools.random_entry_test(ticker))
+
     search_tool = DuckDuckGoSearchRun()
     
     @tool
@@ -47,7 +105,11 @@ def get_financial_agent():
         return search_tool.run(query)
 
     # Bind tools directly to the DeepSeek V4 Flash LLM (via Azure AI Foundry)
-    tools = [get_stock_fundamentals, get_historical_performance, web_news_search]
+    tools = [
+        get_stock_fundamentals, get_historical_performance, web_news_search,
+        check_earnings, validate_trade_plan, check_signal_now,
+        get_support_resistance, size_position, random_entry_test,
+    ]
     llm = AzureAIChatCompletionsModel(
         endpoint=AZURE_INFERENCE_ENDPOINT,
         credential=AZURE_INFERENCE_CREDENTIAL,
@@ -58,7 +120,17 @@ def get_financial_agent():
 
     BASE_SYSTEM = (
         "You are a helpful financial assistant. Use tools to answer questions. "
-        "Always rely on the tools for up-to-date information."
+        "Always rely on the tools for up-to-date information.\n\n"
+        "Several tools compute over this dashboard's own tested engines: "
+        "check_signal_now, get_support_resistance, size_position, check_earnings, "
+        "validate_trade_plan and random_entry_test. Prefer them over your own "
+        "arithmetic or recollection — never estimate a signal, a level, a position "
+        "size or a backtest result yourself when a tool will compute it.\n\n"
+        "Before endorsing a concrete trade, run validate_trade_plan and check_earnings. "
+        "If either fails, say so plainly and do not recommend the trade: refusing is a "
+        "legitimate and useful answer. If random_entry_test shows the rule does not "
+        "beat random entry, report that straight rather than softening it. When a tool "
+        "says it does not know, say that instead of filling the gap."
     )
 
     class BulletproofAgent:

@@ -29,6 +29,7 @@ import simulation as sim
 from backtest import BacktestConfig, CostModel, run_backtest
 import swing_backtest as swing_bt
 import assistant_charts
+import agent_tools
 import fundamentals as fund
 from strategy import AssetClass
 from sentiment import get_hourly_sentiment, get_recent_sentiment, sentiment_prompt_text
@@ -287,12 +288,19 @@ def run_swing_scan(tickers: tuple, overrides: tuple, use_demo: bool, demo_size: 
     cfg = dict(swing.CFG)
     cfg.update(dict(overrides))
 
+    earnings = {}
     if use_demo:
         bars = swing.load_demo(n_names=demo_size, seed=11)
         sector_data = None
     else:
         bars = swing.load_yfinance(sorted(set(list(tickers) + ["SPY"])))
         sector_data = swing.load_yfinance(swing.SECTOR_ETFS)
+        # §05's blackout only bites when it is given dates. Synthetic symbols
+        # have no calendar, so the demo universe stays unfiltered.
+        try:
+            earnings = agent_tools.earnings_map(tickers)
+        except Exception:
+            earnings = {}
 
     if "SPY" not in bars:
         return None, {"stage": "no SPY series — the regime layer needs one"}, cfg, {}
@@ -301,7 +309,7 @@ def run_swing_scan(tickers: tuple, overrides: tuple, use_demo: bool, demo_size: 
     if not bars:
         return None, {"stage": "no symbols survived loading"}, cfg, {}
 
-    out, ctx = swing.run_scan(bars, spy, cfg, sector_data=sector_data)
+    out, ctx = swing.run_scan(bars, spy, cfg, sector_data=sector_data, earnings=earnings)
 
     # Keep the bars behind each candidate so the trade-plan charts do not have to
     # fetch the same history again. Trimmed, since only the recent window is drawn.
