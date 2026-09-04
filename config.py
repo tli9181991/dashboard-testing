@@ -27,6 +27,9 @@ SHOW_TAB_SENTIMENT = parse_bool(os.getenv("SHOW_TAB_SENTIMENT"), True)
 # so importing app.py raised ImportError before this was added.
 SHOW_TAB_SWING = parse_bool(os.getenv("SHOW_TAB_SWING"), True)
 SHOW_TAB_CHATBOT = parse_bool(os.getenv("SHOW_TAB_CHATBOT"), True)
+SHOW_TAB_ASSISTANT = parse_bool(os.getenv("SHOW_TAB_ASSISTANT"), True)
+#: News older than this is not scored as current sentiment.
+NEWS_WINDOW_DAYS = int(os.getenv("NEWS_WINDOW_DAYS", "2"))
 SHOW_TAB_PORTFOLIO = parse_bool(os.getenv("SHOW_TAB_PORTFOLIO"), False)
 
 # Risk & sizing defaults (see sizing.py / regime.py)
