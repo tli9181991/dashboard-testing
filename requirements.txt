@@ -26,5 +26,12 @@ duckduckgo-search
 pydantic
 ddgs
 
+# Interactive Brokers (notebooks/ib_tws_connect.ipynb)
+# Maintained successor to ib_insync. Needs a running TWS/Gateway; nothing else imports it.
+ib_async
+
+# Notebook execution
+ipykernel
+
 # Tests
 pytest>=7.0

@@ -68,6 +68,9 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 - `sentiment.py`: AI-driven news scraper and sentiment evaluator.
 - `config.py`: Environment variable loading and global parameters.
 - `portfolio.csv`: Local state for active holdings.
+- `notebooks/ib_tws_connect.ipynb`: Connects to Interactive Brokers TWS/Gateway and pulls
+  account summary, historical bars, quotes and positions; can write those bars into the
+  `.screen_cache/` layout `data.load_history` reads.
 - `tests/`: pytest suite, including the no-look-ahead proofs.
 
 ## ⚙️ Installation & Setup
@@ -95,6 +98,28 @@ Run the dashboard:
 ```bash
 streamlit run app.py
 ```
+
+## 🔌 Interactive Brokers (optional)
+
+`notebooks/ib_tws_connect.ipynb` talks to a running TWS or IB Gateway over the socket API:
+account summary, contract qualification, historical bars, snapshot quotes and open positions.
+
+```bash
+pip install -r requirements.txt      # brings in ib_async
+jupyter lab notebooks/ib_tws_connect.ipynb
+```
+
+TWS must be running and logged in with **Enable ActiveX and Socket Clients** ticked under
+*Global Configuration ▸ API ▸ Settings*, and the socket port there must match `IB_PORT`
+(7497 TWS paper, 7496 TWS live, 4002/4001 for Gateway). Connection settings come from
+`IB_HOST`, `IB_PORT`, `IB_CLIENT_ID` and `IB_MARKET_DATA_TYPE` — see `.env.example`.
+
+The session connects **read only**, so no cell in it can place an order.
+
+The last section writes IB's daily bars to `.screen_cache/bt_<SYMBOL>_<period>.csv`, which is
+where `data.load_history` looks first. That swaps the price source for the screeners and
+backtests without changing their code — worth doing, since yfinance restates history after
+splits and dividends and returns empty frames when throttled.
 
 ## 🔬 Backtesting
 
