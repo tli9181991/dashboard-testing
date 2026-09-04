@@ -28,11 +28,19 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
    - Runs offline against a synthetic universe, or against your portfolio, watchlist or a custom ticker list.
    - Also usable standalone: `python swing_screener.py --source demo`.
 
-4. **🧠 AI Sector & News Sentiment**
+4. **🤖 Assistant**
+   - Everything about one watchlist or portfolio symbol on a single page.
+   - Price chart with 5/10/20/50 EMAs and labelled support/resistance — the same levels the breakout rule compares against, annotated with price and touch count.
+   - Fundamentals across valuation, profitability, growth, balance sheet, dividend and analyst coverage, with missing fields shown as missing rather than zero.
+   - News sentiment over a recent window (2 days by default). An empty window is reported as empty rather than scored.
+   - Breakout and swing backtests for that symbol, with the simulation layer.
+   - A chat that is handed the computed figures as context, so it reasons over the dashboard's own numbers rather than its recollection, and can search the web.
+
+5. **🧠 AI Sector & News Sentiment**
    - Fetches the latest market news for your portfolio assets.
    - Leverages Google Gemini to synthesize news and generate an aggregated sentiment score and label (Bullish, Bearish, Neutral).
 
-5. **💬 AI Financial Assistant (LangChain)**
+6. **💬 AI Financial Assistant (LangChain)**
    - A custom tool-calling agent equipped with `yfinance` and DuckDuckGo Web Search.
    - Capable of fetching live fundamentals, analyzing historical trends, and summarizing macroeconomic web news.
    - Features a robust conversational memory layer for continuous chat context.
@@ -53,6 +61,8 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 - `app.py`: The Streamlit dashboard UI and orchestration layer.
 - `breakout.py`: Live monitoring path — a thin shell over `strategy.evaluate`.
 - `screening.py`: Scrapes the S&P 500, evaluates Stage-2 parameters, caches top sector performers.
+- `fundamentals.py`: Structured fundamentals from yfinance, treating a missing field as missing.
+- `assistant_charts.py`: Price chart with moving averages and labelled levels, drawn from the strategy's own level detection.
 - `swing_screener.py`: The Swing Universe Funnel — liquidity, tradability, regime, setups, events, sizing and ranking. Runs in the dashboard or as a CLI.
 - `chat_agent.py`: LangChain tool-calling agent with conversational memory.
 - `sentiment.py`: AI-driven news scraper and sentiment evaluator.

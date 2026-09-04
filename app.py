@@ -10,14 +10,17 @@ from config import (
     ACCOUNT_EQUITY, TARGET_VOL, MAX_POSITION_PCT,
     USE_REGIME_GATE, REGIME_BENCHMARK,
     SHOW_TAB_BREAKOUT, SHOW_TAB_SCREENER, SHOW_TAB_SWING, SHOW_TAB_SENTIMENT,
-    SHOW_TAB_CHATBOT, CHAT_HISTORY_DIR, WATCHLIST_FILE
+    SHOW_TAB_CHATBOT, SHOW_TAB_ASSISTANT, NEWS_WINDOW_DAYS,
+    CHAT_HISTORY_DIR, WATCHLIST_FILE
 )
 import data as data_mod
 from breakout import SwingBreakoutMonitor
 from positions import load_portfolio, conversion_notes
 from sizing import SizingParams
-from strategy import StrategyParams, add_indicators
-from chat_history import ChatHistoryStore, make_message
+from strategy import (
+    Position, StrategyParams, add_indicators, drop_forming_bar, evaluate_latest,
+)
+from chat_history import ChatHistoryStore, Conversation, make_message
 from watchlist import WatchlistStore
 import swing_screener as swing
 import swing_charts as swing_charts
@@ -25,8 +28,10 @@ import backtest_charts
 import simulation as sim
 from backtest import BacktestConfig, CostModel, run_backtest
 import swing_backtest as swing_bt
-from strategy import AssetClass, Position
-from sentiment import get_hourly_sentiment
+import assistant_charts
+import fundamentals as fund
+from strategy import AssetClass
+from sentiment import get_hourly_sentiment, get_recent_sentiment, sentiment_prompt_text
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
 
@@ -69,6 +74,96 @@ def fetch_sector_price_history(tickers: tuple, period: str = "6mo") -> dict:
         except Exception:
             continue
     return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def assistant_prices(symbol: str, period: str = "3y") -> pd.DataFrame:
+    """Daily OHLCV for one symbol, for the assistant's charts and backtests."""
+    frame = data_mod.load_history(symbol, period=period, use_cache=False)
+    return frame if frame is not None else pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def assistant_fundamentals(symbol: str) -> dict:
+    """Fundamentals as a plain dict so Streamlit can cache it."""
+    snapshot = fund.fetch(symbol)
+    return {
+        "ok": snapshot.ok, "error": snapshot.error, "name": snapshot.name,
+        "sector": snapshot.sector, "industry": snapshot.industry,
+        "price": snapshot.price, "coverage": snapshot.coverage,
+        "sections": {s: snapshot.rows(s) for s, _ in fund.SECTIONS},
+        "analysts": snapshot.analysts, "upside": snapshot.upside(),
+        "summary": snapshot.business_summary,
+        "prompt_text": snapshot.to_prompt_text(),
+    }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def assistant_sentiment(symbol: str, days: int) -> dict:
+    return get_recent_sentiment(symbol, days=days)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def assistant_breakout_backtest(symbol: str, period: str, equity: float,
+                                target_vol: float, max_position_pct: float,
+                                use_regime: bool, n_paths: int):
+    """Breakout backtest for one symbol, plus the simulation layer."""
+    prices = assistant_prices(symbol, period)
+    if prices.empty:
+        return None, "No price history for this symbol.", {}
+
+    benchmark = None
+    if use_regime:
+        bench = data_mod.load_history(REGIME_BENCHMARK, period=period)
+        if not bench.empty:
+            benchmark = bench["Close"]
+
+    config = BacktestConfig(
+        initial_equity=equity,
+        use_regime_gate=use_regime and benchmark is not None,
+        sizing=SizingParams(target_vol=target_vol, max_position_pct=max_position_pct),
+    )
+    price_data = {symbol: prices}
+    try:
+        result = run_backtest(price_data, benchmark, config)
+    except Exception as exc:
+        return None, f"Backtest failed: {exc}", {}
+    report = sim.summarise(result, price_data, sim.SimulationParams(n_paths=int(n_paths)))
+    return result, report, price_data
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def assistant_swing_backtest(symbol: str, period: str, equity: float,
+                             risk_per_trade: float, n_paths: int):
+    """Swing (triple-barrier) backtest for one symbol, plus the simulation layer."""
+    prices = assistant_prices(symbol, period)
+    if prices.empty:
+        return None, "No price history for this symbol.", None
+
+    spy = data_mod.load_history("SPY", period=period)
+    if spy.empty:
+        spy = data_mod.load_history(REGIME_BENCHMARK, period=period)
+    if spy.empty:
+        return None, "The regime layer needs a market series and none loaded.", None
+
+    cfg = dict(swing.CFG)
+    cfg["account_equity"] = equity
+    cfg["risk_per_trade"] = risk_per_trade
+    config = swing_bt.SwingBacktestConfig(initial_equity=equity)
+
+    try:
+        result = swing_bt.run_swing_backtest({symbol: prices}, spy, cfg, config)
+    except Exception as exc:
+        return None, f"Swing backtest failed: {exc}", None
+
+    params = sim.SimulationParams(n_paths=int(n_paths))
+    report = {
+        "r_bootstrap": sim.bootstrap_r_paths(result.trades["r_multiple"], params)
+        if not result.trades.empty else None,
+        "random_entry": sim.random_entry_benchmark({symbol: prices}, result.trades, params)
+        if not result.trades.empty else None,
+    }
+    return result, report, {symbol: prices}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -382,6 +477,7 @@ if SHOW_TAB_BREAKOUT: tab_titles.append("📈 Monitoring")
 if SHOW_TAB_SCREENER: tab_titles.append("🔍 Stock Selection Screener")
 if SHOW_TAB_SWING: tab_titles.append("🎯 Swing Screener")
 if SHOW_TAB_SENTIMENT: tab_titles.append("🧠 AI Sector & News Sentiment")
+if SHOW_TAB_ASSISTANT: tab_titles.append("🤖 Assistant")
 if SHOW_TAB_CHATBOT: tab_titles.append("💬 AI Financial Assistant")
 
 rendered_tabs = st.tabs(tab_titles)
@@ -1134,7 +1230,330 @@ if SHOW_TAB_SENTIMENT:
                 st.caption(f"📰 **{art['publisher']}**: {art['title']}")
     tab_index += 1
 
-# TAB 5: LangChain AI Financial Assistant
+# TAB 5: Assistant — everything about one symbol in one place
+if SHOW_TAB_ASSISTANT:
+    with rendered_tabs[tab_index]:
+        st.subheader("🤖 Assistant")
+
+        asst_choices = sorted(set(list(holdings) + all_watched))
+        if not asst_choices:
+            st.info(
+                "Nothing to analyse yet. Add positions to `portfolio.csv`, or pick "
+                "stocks from either screener to build a watchlist."
+            )
+        else:
+            a1, a2, a3 = st.columns([2, 1, 1])
+            with a1:
+                asst_symbol = st.selectbox("Symbol", asst_choices, key="asst_symbol")
+            with a2:
+                asst_period = st.selectbox("History", ["1y", "2y", "3y", "5y"], index=2,
+                                           key="asst_period")
+            with a3:
+                asst_lookback = st.slider("Chart window (sessions)", 60, 500, 180, 20,
+                                          key="asst_lookback")
+
+            asst_prices = assistant_prices(asst_symbol, asst_period)
+            if asst_prices.empty:
+                st.error(f"⚠️ No price history could be loaded for {asst_symbol}.")
+            else:
+                # Everything the chat is later given, collected as it is computed.
+                asst_context: list[str] = []
+
+                # ── Price, moving averages and levels ────────────────────────
+                st.plotly_chart(
+                    assistant_charts.build_price_chart(
+                        asst_symbol, asst_prices, lookback=int(asst_lookback)),
+                    width="stretch", key="asst_price",
+                )
+                levels_text = assistant_charts.levels_prompt_text(asst_symbol, asst_prices)
+                st.caption(
+                    "Levels are the ones the breakout rule compares against — "
+                    "confirmed swings merged within one ATR, labelled with price and "
+                    "touch count."
+                )
+                asst_context.append(levels_text)
+
+                # Decide on completed bars only, as every other tab does — the
+                # exit rule is defined on the close, so reading a still-forming
+                # bar makes the signal fire and unfire intraday.
+                asst_closed = drop_forming_bar(asst_prices, AssetClass.infer(asst_symbol))
+                asst_frame, asst_decision = evaluate_latest(
+                    asst_closed if not asst_closed.empty else asst_prices,
+                    Position(), StrategyParams(), True,
+                )
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Last", f"${asst_decision.price:,.2f}")
+                p2.metric("10 SMA", f"${asst_decision.sma_exit:,.2f}")
+                p3.metric("ATR", f"${asst_decision.atr:,.2f}")
+                p4.metric("Breakout signal", asst_decision.action.value)
+                asst_context.append(
+                    f"Breakout engine on {asst_symbol}: signal {asst_decision.action.value}, "
+                    f"last {asst_decision.price:,.2f}, 10 SMA {asst_decision.sma_exit:,.2f}, "
+                    f"ATR {asst_decision.atr:,.2f}. " + " ".join(asst_decision.logs)
+                )
+
+                st.markdown("---")
+
+                # ── Fundamentals ────────────────────────────────────────────
+                st.markdown("#### Fundamentals")
+                asst_fund = assistant_fundamentals(asst_symbol)
+                if not asst_fund["ok"]:
+                    st.warning(f"Fundamentals unavailable: {asst_fund['error'] or 'no data'}")
+                else:
+                    header = " · ".join(x for x in (asst_fund["name"], asst_fund["sector"],
+                                                    asst_fund["industry"]) if x)
+                    if header:
+                        st.caption(header)
+
+                    if asst_fund["analysts"]:
+                        f1, f2, f3 = st.columns(3)
+                        consensus = str(asst_fund["analysts"].get("recommendationKey", "—"))
+                        f1.metric("Consensus", consensus.replace("_", " ").title())
+                        target = asst_fund["analysts"].get("targetMeanPrice")
+                        f2.metric("Mean target",
+                                  f"${float(target):,.2f}" if target else "—")
+                        f3.metric("Implied upside",
+                                  f"{asst_fund['upside']:+.1%}" if asst_fund["upside"] is not None else "—")
+
+                    fund_cols = st.columns(3)
+                    for n, (section_name, _) in enumerate(fund.SECTIONS):
+                        rows = [r for r in asst_fund["sections"].get(section_name, [])
+                                if r[1] != "—"]
+                        with fund_cols[n % 3]:
+                            st.markdown(f"**{section_name}**")
+                            if rows:
+                                st.dataframe(
+                                    pd.DataFrame(rows, columns=["Metric", "Value"]),
+                                    width="stretch", hide_index=True,
+                                )
+                            else:
+                                st.caption("Not reported for this symbol.")
+
+                    st.caption(
+                        f"The data vendor supplied {asst_fund['coverage']:.0%} of the "
+                        "tracked fields. Blanks are missing data, not zeros."
+                    )
+                    if asst_fund["summary"]:
+                        with st.expander("Business summary"):
+                            st.write(asst_fund["summary"])
+                asst_context.append(asst_fund["prompt_text"])
+
+                st.markdown("---")
+
+                # ── News sentiment over the last N days ─────────────────────
+                st.markdown(f"#### News sentiment — last {NEWS_WINDOW_DAYS} days")
+                asst_news = assistant_sentiment(asst_symbol, int(NEWS_WINDOW_DAYS))
+                if asst_news.get("error"):
+                    st.info(asst_news["error"])
+                else:
+                    sdata = asst_news["data"]
+                    n1, n2, n3 = st.columns(3)
+                    n1.metric("Label", str(sdata["label"]).title())
+                    n2.metric("Score", f"{sdata['score']:+.2f}")
+                    n3.metric("Confidence", f"{sdata['confidence']:.0%}")
+                    st.progress(max(0.0, min(1.0, (sdata["score"] + 1) / 2)))
+
+                    g1, g2 = st.columns(2)
+                    with g1:
+                        if sdata.get("positive_factors"):
+                            st.markdown("**Positive**")
+                            for item in sdata["positive_factors"]:
+                                st.markdown(f"- {item}")
+                    with g2:
+                        if sdata.get("negative_factors"):
+                            st.markdown("**Negative**")
+                            for item in sdata["negative_factors"]:
+                                st.markdown(f"- {item}")
+
+                    with st.expander(f"Headlines ({len(asst_news['articles'])})"):
+                        for art in asst_news["articles"]:
+                            stamp = str(art.get("published_at") or "")[:16].replace("T", " ")
+                            st.markdown(
+                                f"**{art.get('publisher') or 'unknown'}** · {stamp}  \n"
+                                f"{art.get('title')}"
+                            )
+                asst_context.append(sentiment_prompt_text(asst_news))
+
+                st.markdown("---")
+
+                # ── Backtests ───────────────────────────────────────────────
+                st.markdown("#### Backtests")
+                st.caption(
+                    "Both replay this one symbol. A single-name backtest is a "
+                    "characterisation, not an edge estimate — there is no "
+                    "cross-section to average the luck out of."
+                )
+                bt_tab, sw_tab = st.tabs(["📈 Breakout", "🎯 Swing"])
+
+                with bt_tab:
+                    if st.button("Run breakout backtest", key="asst_bt_run", type="primary"):
+                        assistant_breakout_backtest.clear()
+                    with st.spinner("Replaying the breakout rule..."):
+                        a_res, a_rep, a_prices = assistant_breakout_backtest(
+                            asst_symbol, asst_period, float(account_equity),
+                            float(target_vol), float(max_position_pct), True, 800,
+                        )
+                    if a_res is None:
+                        st.error(f"⚠️ {a_rep}")
+                    elif a_res.trades.empty:
+                        st.info("The breakout rule took no trades on this symbol.")
+                        asst_context.append(
+                            f"Breakout backtest on {asst_symbol}: no trades over {asst_period}.")
+                    else:
+                        am = a_res.metrics
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Return", f"{am['total_return']:+.1%}")
+                        c2.metric("Buy & hold",
+                                  f"{a_rep['buy_and_hold'].get('total_return', 0):+.1%}")
+                        c3.metric("Trades", am["n_trades"])
+                        c4.metric("Max drawdown", f"{am['max_drawdown']:.1%}")
+
+                        st.plotly_chart(
+                            backtest_charts.build_equity_comparison(a_res, a_rep["buy_and_hold"]),
+                            width="stretch", key="asst_bt_equity")
+                        if a_rep.get("random_entry"):
+                            st.plotly_chart(
+                                backtest_charts.build_random_entry_distribution(a_rep["random_entry"]),
+                                width="stretch", key="asst_bt_random")
+                        if a_rep.get("bootstrap") is not None:
+                            st.plotly_chart(
+                                backtest_charts.build_bootstrap_fan(
+                                    a_rep["bootstrap"], a_res.trades["return_pct"]),
+                                width="stretch", key="asst_bt_fan")
+
+                        pct = (a_rep.get("random_entry") or {}).get("percentile")
+                        asst_context.append(
+                            f"Breakout backtest on {asst_symbol} over {asst_period}: "
+                            f"return {am['total_return']:+.1%} against buy-and-hold "
+                            f"{a_rep['buy_and_hold'].get('total_return', 0):+.1%}, "
+                            f"{am['n_trades']} trades, win rate {am['win_rate']:.0%}, "
+                            f"max drawdown {am['max_drawdown']:.1%}"
+                            + (f", average trade beat {pct:.0f}% of random entries of the "
+                               "same length." if pct is not None else ".")
+                        )
+
+                with sw_tab:
+                    if st.button("Run swing backtest", key="asst_sw_run", type="primary"):
+                        assistant_swing_backtest.clear()
+                    st.caption("Replays both swing setups bar by bar — expect tens of seconds.")
+                    with st.spinner("Replaying the swing setups..."):
+                        s_res, s_rep, _ = assistant_swing_backtest(
+                            asst_symbol, asst_period, float(account_equity),
+                            float(swing.CFG["risk_per_trade"]), 800,
+                        )
+                    if s_res is None:
+                        st.error(f"⚠️ {s_rep}")
+                    else:
+                        sm = s_res.metrics
+                        d1, d2, d3, d4 = st.columns(4)
+                        d1.metric("Setups seen", sm["setups_seen"])
+                        d2.metric("Orders filled", sm["n_trades"],
+                                  delta=f"{sm['fill_rate']:.0%} of {sm['orders_placed']}")
+                        d3.metric("Expectancy", f"{sm['expectancy_r']:+.2f} R")
+                        d4.metric("Return", f"{sm['total_return']:+.1%}")
+
+                        st.plotly_chart(
+                            backtest_charts.build_order_funnel(s_res.stats, sm["n_trades"]),
+                            width="stretch", key="asst_sw_funnel")
+
+                        if s_res.trades.empty:
+                            st.info("No swing entry order ever filled on this symbol.")
+                            asst_context.append(
+                                f"Swing backtest on {asst_symbol}: {sm['setups_seen']} setups "
+                                f"but no entry order filled over {asst_period}.")
+                        else:
+                            st.plotly_chart(
+                                backtest_charts.build_outcome_breakdown(s_res.trades, s_res.stats),
+                                width="stretch", key="asst_sw_outcomes")
+                            st.plotly_chart(
+                                backtest_charts.build_r_multiple_distribution(s_res.trades),
+                                width="stretch", key="asst_sw_rdist")
+                            st.plotly_chart(
+                                backtest_charts.build_mae_vs_outcome(s_res.trades),
+                                width="stretch", key="asst_sw_mae")
+                            if s_rep.get("r_bootstrap") is not None:
+                                st.plotly_chart(
+                                    backtest_charts.build_r_fan(
+                                        s_rep["r_bootstrap"], s_res.trades["r_multiple"]),
+                                    width="stretch", key="asst_sw_rfan")
+
+                            spct = (s_rep.get("random_entry") or {}).get("percentile")
+                            asst_context.append(
+                                f"Swing backtest on {asst_symbol} over {asst_period}: "
+                                f"{sm['setups_seen']} setups, {sm['orders_placed']} orders, "
+                                f"{sm['n_trades']} filled ({sm['fill_rate']:.0%}), "
+                                f"expectancy {sm['expectancy_r']:+.2f}R, win rate "
+                                f"{sm['win_rate']:.0%}, median MAE {sm['median_mae_r']:.2f}R"
+                                + (f", average trade beat {spct:.0f}% of random entries."
+                                   if spct is not None else ".")
+                            )
+
+                st.markdown("---")
+
+                # ── Chat over exactly this data ─────────────────────────────
+                st.markdown("#### Ask about this symbol")
+                asst_blob = "\n\n".join(asst_context)
+                with st.expander("What the assistant can see"):
+                    st.text(asst_blob)
+
+                asst_store = ChatHistoryStore(CHAT_HISTORY_DIR / "assistant")
+                asst_key = f"asst_msgs_{asst_symbol}"
+                if asst_key not in st.session_state:
+                    opened = asst_store.load(asst_symbol)
+                    st.session_state[asst_key] = list(opened.messages) if opened else []
+
+                h1, h2 = st.columns([8, 2])
+                with h2:
+                    if st.button("🗑️ Clear", key="asst_clear", width="stretch"):
+                        st.session_state[asst_key] = []
+                        asst_store.save(Conversation(id=asst_symbol, created_at="",
+                                                     updated_at="", messages=[]))
+                        st.rerun()
+
+                for message in st.session_state[asst_key]:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+
+                if asst_prompt := st.chat_input(
+                        f"Ask about {asst_symbol} — the charts, the backtests, the news…",
+                        key="asst_chat"):
+                    prior = list(st.session_state[asst_key])
+                    st.session_state[asst_key].append(make_message("user", asst_prompt))
+                    with st.chat_message("user"):
+                        st.markdown(asst_prompt)
+
+                    with st.chat_message("assistant"):
+                        with st.spinner("Reading the dashboard and searching..."):
+                            agent = get_financial_agent()
+                            if not agent:
+                                answer = ("⚠️ Configure AZURE_INFERENCE_ENDPOINT and "
+                                          "AZURE_INFERENCE_CREDENTIAL in your `.env`.")
+                            else:
+                                try:
+                                    from langchain_core.messages import AIMessage, HumanMessage
+                                    history = [
+                                        HumanMessage(content=m["content"]) if m["role"] == "user"
+                                        else AIMessage(content=m["content"]) for m in prior
+                                    ]
+                                    answer = agent.invoke({
+                                        "input": asst_prompt,
+                                        "chat_history": history,
+                                        "context": asst_blob,
+                                    })["output"]
+                                except Exception as exc:
+                                    answer = f"Agent encountered an error: {exc}"
+                            st.markdown(answer)
+
+                    st.session_state[asst_key].append(make_message("assistant", answer))
+                    conversation = asst_store.load(asst_symbol)
+                    if conversation is None:
+                        conversation = Conversation(id=asst_symbol, created_at="",
+                                                    updated_at="", messages=[])
+                    conversation.messages = st.session_state[asst_key]
+                    asst_store.save(conversation)
+    tab_index += 1
+
+# TAB 6: LangChain AI Financial Assistant
 if SHOW_TAB_CHATBOT:
     with rendered_tabs[tab_index]:
         chat_store = ChatHistoryStore(CHAT_HISTORY_DIR)

@@ -209,6 +209,22 @@ def _merge(levels: Sequence[Level], tolerance: float) -> list[tuple[float, str, 
     return merged
 
 
+def merged_levels(frame: "StrategyFrame", i: Optional[int] = None) -> list[tuple[float, str, int]]:
+    """Support and resistance as the engine sees them at bar ``i``.
+
+    Returns ``(price, kind, touches)``. Exposed so the charts can label exactly the
+    levels the entry rule is comparing against — a chart drawing different levels
+    from the ones the signal uses is worse than a chart with no levels on it.
+    """
+    if i is None:
+        i = len(frame) - 1
+    if i < 0:
+        return []
+    atr = float(frame.df.iloc[i]["ATR"])
+    tolerance = max(1e-9, frame.params.level_merge_atr_mult * atr)
+    return _merge(frame.levels_asof(i), tolerance)
+
+
 def prepare(df: pd.DataFrame, params: StrategyParams = StrategyParams()) -> StrategyFrame:
     """Compute everything the strategy needs, once, for a whole price history."""
     annotated = add_indicators(df, params)
