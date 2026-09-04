@@ -484,3 +484,342 @@ def render_random_entry(info: dict) -> str:
         + (f"{pct:.0f}th percentile. {verdict}." if pct is not None else f"{verdict}.")
         + " A single symbol is a characterisation, not an edge estimate."
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The app's own trading strategies, as callable tools
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _regime_state(period: str = DEFAULT_PERIOD, index=None) -> tuple[str, str]:
+    """Risk-on / risk-off from the benchmark's own trend.
+
+    The full funnel also weighs market breadth across a universe, which a
+    single-symbol call has no way to compute, so this is the narrower of the two
+    readings and says so.
+    """
+    bench = _prices("^GSPC", period)
+    if bench.empty:
+        return "risk_on", "benchmark unavailable — regime not applied"
+    if index is None:
+        index = bench.index
+    gate = regime_mod.build_gate(bench["Close"], index)
+    risk_on = bool(gate.iloc[-1])
+    return ("risk_on" if risk_on else "risk_off",
+            "benchmark above its 200 SMA" if risk_on
+            else "benchmark below its 200 SMA — the funnel closes the long side here")
+
+
+def check_swing_setups(ticker: str, period: str = DEFAULT_PERIOD,
+                       equity: float = 100_000.0) -> dict:
+    """Run both Swing Universe Funnel setups on the latest closed bar.
+
+    §04A is a momentum-pullback continuation whose entry rests *above* the market
+    as a stop-buy; §04B is the ICT 2022 model whose entry rests *below* it in a
+    fair-value gap. Each returns a complete bracket or nothing — "no setup today"
+    is the normal answer and is reported as such rather than softened into a
+    weaker signal.
+    """
+    ticker = ticker.strip().upper()
+    frame = _prices(ticker, period)
+    if frame.empty:
+        return {"ticker": ticker, "error": "No price history could be loaded."}
+
+    closed = _completed(frame, ticker)
+    if len(closed) < 260:
+        return {"ticker": ticker, "error":
+                f"Only {len(closed)} bars — §04A needs 252 for its trend template."}
+
+    cfg = dict(swing.CFG)
+    cfg["account_equity"] = equity
+    state, regime_note = _regime_state(period, closed.index)
+
+    setups = []
+    for setup in (swing.momentum_setup(closed, cfg), swing.ict_setup(closed, cfg)):
+        if not setup:
+            continue
+        shares = swing.position_size(setup["entry"], setup["stop"], closed, state, cfg)
+        risk_per_share = setup["entry"] - setup["stop"]
+        setups.append({
+            "variant": setup["variant"], "entry": setup["entry"],
+            "stop": setup["stop"], "tp1": setup["tp1"], "tp2": setup["tp2"],
+            "r_to_tp1": setup["r_to_tp1"],
+            "r_to_tp2": (setup["tp2"] - setup["entry"]) / risk_per_share
+            if risk_per_share > 0 else 0.0,
+            "shares": shares, "dollar_risk": shares * risk_per_share,
+            "order_type": "stop-buy above the market" if setup["variant"].startswith("A")
+            else "limit-buy below the market",
+            "note": setup["note"],
+        })
+
+    return {"ticker": ticker, "error": "", "setups": setups,
+            "regime": state, "regime_note": regime_note,
+            "last_price": float(closed["Close"].iloc[-1]),
+            "as_of": str(closed.index[-1])[:10]}
+
+
+def render_swing_setups(info: dict) -> str:
+    if info.get("error"):
+        return f"Swing setups for {info['ticker']}: {info['error']}"
+    head = (f"Swing setups on {info['ticker']} as of {info['as_of']} "
+            f"(last {info['last_price']:,.2f}, regime {info['regime']} — "
+            f"{info['regime_note']}):")
+    if not info["setups"]:
+        return head + " neither §04A momentum-pullback nor §04B ICT fired today. " \
+                      "No setup is the normal answer; do not read it as a weak signal."
+    lines = [head]
+    for s in info["setups"]:
+        # A zero size is the regime layer closing the long side, not a broken
+        # number — say which, or the plan reads as "buy 0 shares".
+        if s["shares"] < 1:
+            sizing_note = ("Size 0 — the regime layer allows no new long risk today, "
+                           "so this is a setup to watch, not one to take."
+                           if info["regime"] == "risk_off" else
+                           "Size 0 — the stop is too wide to take a position at this "
+                           "equity and risk budget.")
+        else:
+            sizing_note = f"Size {s['shares']:,} shares, ${s['dollar_risk']:,.0f} at risk."
+        lines.append(
+            f"  {s['variant']} — {s['note']}. Entry {s['entry']:,.2f} "
+            f"({s['order_type']}), stop {s['stop']:,.2f}, TP1 {s['tp1']:,.2f} "
+            f"({s['r_to_tp1']:.2f}R), TP2 {s['tp2']:,.2f} ({s['r_to_tp2']:.2f}R). "
+            + sizing_note
+        )
+    lines.append("  A resting entry that never trades is not a position — roughly "
+                 "half of these historically expire unfilled.")
+    return "\n".join(lines)
+
+
+def screen_symbol(ticker: str, period: str = DEFAULT_PERIOD) -> dict:
+    """Does this name pass the funnel's filters before any setup is considered?
+
+    Runs §01 liquidity, §02 tradability, the Stage-2 trend template and relative
+    strength against the benchmark. A name failing here is not tradeable by this
+    system regardless of how the chart looks.
+    """
+    ticker = ticker.strip().upper()
+    frame = _prices(ticker, period)
+    if frame.empty:
+        return {"ticker": ticker, "error": "No price history could be loaded."}
+
+    closed = _completed(frame, ticker)
+    cfg = dict(swing.CFG)
+
+    liquid, why = swing.liquidity_gate(closed, cfg)
+    metrics = swing.tradability_metrics(closed, cfg) if liquid else {}
+    stage2 = swing.trend_template(closed) if len(closed) >= 252 else False
+
+    rs_vs_market = None
+    bench = _prices("^GSPC", period)
+    lookback = 126
+    if not bench.empty and len(closed) > lookback and len(bench) > lookback:
+        stock = float(closed["Close"].iloc[-1] / closed["Close"].iloc[-lookback] - 1)
+        market = float(bench["Close"].iloc[-1] / bench["Close"].iloc[-lookback] - 1)
+        rs_vs_market = stock - market
+
+    return {
+        "ticker": ticker, "error": "",
+        "liquidity_pass": bool(liquid), "liquidity_reason": why,
+        "tradability": {
+            "adr_pct": metrics.get("adr_pct"),
+            "efficiency_ratio": metrics.get("er"),
+            "gap_score": metrics.get("gap_score"),
+            "vol_regime": metrics.get("vol_regime"),
+            "passes_floor": bool(metrics.get("passes_floor", False)),
+        } if metrics else {},
+        "stage2_trend_template": bool(stage2),
+        "rs_126d_vs_market": rs_vs_market,
+        "bands": {"adr": (cfg["adr_min"], cfg["adr_max"]),
+                  "er_min": cfg["er_min"], "gap_max": cfg["gap_score_max"],
+                  "vol_regime": (cfg["vol_regime_min"], cfg["vol_regime_max"])},
+    }
+
+
+def render_screen(info: dict) -> str:
+    if info.get("error"):
+        return f"Screen for {info['ticker']}: {info['error']}"
+    if not info["liquidity_pass"]:
+        return (f"{info['ticker']} FAILS the §01 liquidity gate ({info['liquidity_reason']}). "
+                "This system cannot trade it, whatever the chart shows.")
+
+    t, b = info["tradability"], info["bands"]
+    parts = [f"{info['ticker']} passes the §01 liquidity gate."]
+    if t:
+        parts.append(
+            f"§02 tradability {'PASS' if t['passes_floor'] else 'FAIL'}: "
+            f"ADR {t['adr_pct']:.2f}% (band {b['adr'][0]}–{b['adr'][1]}), "
+            f"efficiency ratio {t['efficiency_ratio']:.2f} (min {b['er_min']}), "
+            f"gap score {t['gap_score']:.2f} (max {b['gap_max']}), "
+            f"vol regime {t['vol_regime']:.2f} "
+            f"(band {b['vol_regime'][0]}–{b['vol_regime'][1]})."
+        )
+    parts.append(f"Stage-2 trend template: {'PASS' if info['stage2_trend_template'] else 'FAIL'}.")
+    if info["rs_126d_vs_market"] is not None:
+        rs = info["rs_126d_vs_market"]
+        parts.append(f"126-day relative strength vs the market: {rs:+.1%} "
+                     f"({'outperforming' if rs > 0 else 'lagging'}).")
+    return " ".join(parts)
+
+
+def backtest_strategy(ticker: str, strategy: str = "breakout",
+                      period: str = DEFAULT_PERIOD, equity: float = 100_000.0) -> dict:
+    """Replay one of the app's strategies over this symbol's history.
+
+    ``strategy`` is "breakout" (the moving-average rule) or "swing" (the
+    triple-barrier replay of the two setups). The swing replay evaluates both
+    setups on every bar and takes tens of seconds.
+    """
+    ticker = ticker.strip().upper()
+    strategy = strategy.strip().lower()
+    if strategy not in {"breakout", "swing"}:
+        return {"ticker": ticker, "error":
+                f"Unknown strategy {strategy!r}. Use 'breakout' or 'swing'."}
+
+    frame = _prices(ticker, period)
+    if frame.empty:
+        return {"ticker": ticker, "error": "No price history could be loaded."}
+
+    bench = _prices("^GSPC", period)
+    price_data = {ticker: frame}
+
+    if strategy == "breakout":
+        benchmark = bench["Close"] if not bench.empty else None
+        try:
+            result = run_backtest(price_data, benchmark,
+                                  BacktestConfig(initial_equity=equity,
+                                                 use_regime_gate=benchmark is not None))
+        except Exception as exc:
+            return {"ticker": ticker, "error": f"Backtest failed: {exc}"}
+        m = result.metrics
+        payload = {"n_trades": m["n_trades"], "total_return": m["total_return"],
+                   "win_rate": m["win_rate"], "max_drawdown": m["max_drawdown"],
+                   "sharpe": m["sharpe"], "profit_factor": m["profit_factor"],
+                   "exposure": m["exposure"]}
+    else:
+        spy = bench if not bench.empty else _prices("SPY", period)
+        if spy.empty:
+            return {"ticker": ticker,
+                    "error": "The swing replay needs a market series and none loaded."}
+        cfg = dict(swing.CFG)
+        cfg["account_equity"] = equity
+        try:
+            import swing_backtest as swing_bt
+            result = swing_bt.run_swing_backtest(
+                price_data, spy, cfg,
+                swing_bt.SwingBacktestConfig(initial_equity=equity))
+        except Exception as exc:
+            return {"ticker": ticker, "error": f"Swing backtest failed: {exc}"}
+        m = result.metrics
+        payload = {"setups_seen": m["setups_seen"], "orders_placed": m["orders_placed"],
+                   "n_trades": m["n_trades"], "fill_rate": m["fill_rate"],
+                   "orders_expired": m["orders_expired"],
+                   "expectancy_r": m["expectancy_r"], "win_rate": m["win_rate"],
+                   "total_return": m["total_return"], "max_drawdown": m["max_drawdown"],
+                   "median_mae_r": m["median_mae_r"]}
+
+    buy_hold = sim.buy_and_hold(price_data)
+    return {"ticker": ticker, "error": "", "strategy": strategy, "period": period,
+            "metrics": payload,
+            "buy_and_hold_return": buy_hold.get("total_return")}
+
+
+def render_backtest(info: dict) -> str:
+    if info.get("error"):
+        return f"Backtest for {info['ticker']}: {info['error']}"
+    m = info["metrics"]
+    head = f"{info['strategy']} strategy on {info['ticker']} over {info['period']}: "
+    if info["strategy"] == "breakout":
+        body = (f"{m['n_trades']} trades, total return {m['total_return']:+.1%}, "
+                f"win rate {m['win_rate']:.0%}, Sharpe {m['sharpe']:.2f}, "
+                f"max drawdown {m['max_drawdown']:.1%}, "
+                f"in the market {m['exposure']:.0%} of the time.")
+    else:
+        body = (f"{m['setups_seen']} setups, {m['orders_placed']} orders placed, "
+                f"{m['n_trades']} filled ({m['fill_rate']:.0%}) and "
+                f"{m['orders_expired']} expired without trading. "
+                f"Expectancy {m['expectancy_r']:+.2f}R, win rate {m['win_rate']:.0%}, "
+                f"total return {m['total_return']:+.1%}, "
+                f"max drawdown {m['max_drawdown']:.1%}, "
+                f"median worst excursion {m['median_mae_r']:.2f}R.")
+    tail = ""
+    if info["buy_and_hold_return"] is not None:
+        tail = (f" Buy and hold over the same window: "
+                f"{info['buy_and_hold_return']:+.1%}.")
+    return (head + body + tail +
+            " One symbol is a characterisation, not an edge estimate — there is no "
+            "cross-section here to average the luck out of.")
+
+
+def scan_watchlist(strategy: str = "breakout", period: str = DEFAULT_PERIOD,
+                   max_symbols: int = 25) -> dict:
+    """Run a strategy across the watchlist and portfolio, and list what fired.
+
+    ``strategy`` is "breakout" (the moving-average rule's BUY/SELL) or "swing"
+    (whether either setup has a live bracket). This is the only tool that sees
+    across symbols rather than one at a time.
+    """
+    strategy = strategy.strip().lower()
+    if strategy not in {"breakout", "swing"}:
+        return {"error": f"Unknown strategy {strategy!r}. Use 'breakout' or 'swing'."}
+
+    try:
+        import config as app_config
+        import positions as positions_mod
+        import watchlist as watchlist_mod
+        symbols = sorted(set(
+            list(positions_mod.load_portfolio(app_config.WATCHLIST_FILE.parent / "portfolio.csv"))
+            + watchlist_mod.WatchlistStore(app_config.WATCHLIST_FILE).symbols()
+        ))
+    except Exception:
+        symbols = []
+
+    if not symbols:
+        return {"error": "The watchlist and portfolio are both empty — nothing to scan.",
+                "strategy": strategy}
+
+    truncated = len(symbols) > max_symbols
+    symbols = symbols[:max_symbols]
+
+    hits, quiet, failed = [], [], []
+    for symbol in symbols:
+        try:
+            if strategy == "breakout":
+                info = check_signal_now(symbol, period)
+                if info.get("error"):
+                    failed.append(f"{symbol}: {info['error']}")
+                elif info["action"] in {"BUY", "SELL"}:
+                    hits.append(f"{symbol}: {info['action']} at {info['price']:,.2f}")
+                else:
+                    quiet.append(symbol)
+            else:
+                info = check_swing_setups(symbol, period)
+                if info.get("error"):
+                    failed.append(f"{symbol}: {info['error']}")
+                elif info["setups"]:
+                    for s in info["setups"]:
+                        hits.append(f"{symbol}: {s['variant']} entry {s['entry']:,.2f}, "
+                                    f"stop {s['stop']:,.2f}, {s['r_to_tp2']:.1f}R to TP2")
+                else:
+                    quiet.append(symbol)
+        except Exception as exc:
+            failed.append(f"{symbol}: {exc}")
+
+    return {"error": "", "strategy": strategy, "scanned": len(symbols),
+            "truncated": truncated, "hits": hits, "quiet": quiet, "failed": failed}
+
+
+def render_scan(info: dict) -> str:
+    if info.get("error"):
+        return f"Scan: {info['error']}"
+    lines = [f"{info['strategy']} scan across {info['scanned']} watchlist and "
+             f"portfolio symbols:"]
+    if info["hits"]:
+        lines.extend(f"  {h}" for h in info["hits"])
+    else:
+        lines.append("  nothing fired today.")
+    if info["quiet"]:
+        lines.append(f"  No signal: {', '.join(info['quiet'])}")
+    if info["failed"]:
+        lines.append(f"  Could not evaluate: {'; '.join(info['failed'])}")
+    if info["truncated"]:
+        lines.append("  (list truncated — scan was capped)")
+    return "\n".join(lines)
