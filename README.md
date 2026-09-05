@@ -67,6 +67,9 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 - `analyst.py`: Whole-position analysis for one symbol — trend stage, levels, news,
   a computed trade plan (buy zone, stop, targets, size) and a separate long-term
   hold verdict. Every price is computed; the LLM only narrates.
+- `analyst_lab.py`: Scenarios, plan invariants and the plan chart — the testable
+  core of the analyst's test bench.
+- `analyst_app.py`: Streamlit test bench for the analyst (`streamlit run analyst_app.py`).
 - `chat_agent.py`: LangChain tool-calling agent with conversational memory.
 - `sentiment.py`: AI-driven news scraper and sentiment evaluator.
 - `config.py`: Environment variable loading and global parameters.
@@ -135,6 +138,34 @@ Two verdicts come back separately, because they answer different questions:
 - **Long-term hold** — a separate rubric over trend, relative strength, profitability,
   growth, balance sheet and news. Missing inputs count as unknown, never as a pass or a
   fail, and a verdict reached from price alone is labelled `basis: price only`.
+
+### Test bench
+
+```bash
+streamlit run analyst_app.py
+```
+
+A second, standalone Streamlit app whose only job is to exercise the analyst. It is
+separate from `app.py` on purpose: it exists to break the analyst, not to trade from
+it, and coupling it to the main dashboard would mean the bench breaks whenever the
+dashboard does.
+
+It opens on a **scenario harness** rather than a ticker box, which is the argument for
+the whole app. Pointing an advisor at whatever the market is doing today exercises one
+of its paths; the risk-off veto, the refusal on reward:risk, the pullback anchor and the
+short-history error only appear on days you cannot schedule. Each scenario is synthetic,
+deterministic and offline, and carries the verdict it is supposed to reach — so the
+summary table is a regression check you can read, not a demo.
+
+Three tabs: **Scenarios** (all seven, with a pass/fail row each and full drill-down),
+**Live symbol** (the same panels against a real ticker, reading `.screen_cache/` first so
+IB bars are preferred over yfinance), and **Narration** (the model's prose beside the
+computed numbers, to check no new price appeared).
+
+Every result also shows its **invariants** recomputed live — stop below entry, targets
+above it, risk inside the ATR budget, size inside the equity cap — so the guarantees are
+visible rather than merely claimed. Sidebar parameters flow through every panel, which is
+the quickest way to see what a threshold actually does to the output.
 
 ## 🔌 Interactive Brokers (optional)
 

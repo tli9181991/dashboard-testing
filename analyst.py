@@ -65,7 +65,10 @@ class AnalystParams:
     max_risk_atr: float = 2.75
     #: Below this reward:risk the trade is reported as not worth taking.
     min_reward_risk: float = 2.0
-    #: Fallback second target when no second resistance is confirmed.
+    #: Fallback targets when no confirmed resistance sits overhead. Kept distinct
+    #: from ``min_reward_risk``: projecting a target at exactly the minimum and
+    #: then testing it against that minimum is a check that cannot fail.
+    tp1_r_multiple: float = 2.0
     tp2_r_multiple: float = 2.5
     #: Half-width of an entry zone anchored on a level, in ATR.
     entry_band_atr: float = 0.25
@@ -354,17 +357,26 @@ def _entry_zone(trend: TrendState, decision: strat.Decision, supports: Sequence[
     if trend.stage in ("advancing", "pullback"):
         # Not a fresh signal, so name the level worth waiting for rather than
         # endorsing a fill at whatever price happens to be printing.
-        candidates = [s["price"] for s in supports if s["price"] < price]
-        anchor = max(candidates) if candidates else None
-        if anchor is None or anchor < trend.ema50:
-            anchor = max(trend.ema20, trend.ema50) if trend.ema20 < price else trend.ema20
-            notes.append(f"No confirmed support close below; anchored on the "
-                         f"{'20' if anchor == trend.ema20 else '50'} EMA {anchor:,.2f}.")
-        else:
-            notes.append(f"Anchored on confirmed support {anchor:,.2f}.")
-        if anchor >= price:
-            notes.append("Price is already at or below that level; treat it as live, "
-                         "not as a limit to wait for.")
+        #
+        # The anchor must sit BELOW the current price. Confirmed support and the
+        # moving averages are both candidates, and the one that matters is the
+        # highest of them — the first level price would meet on a further dip.
+        # Anchoring above the price would propose buying a bounce back into
+        # resistance and call it a pullback entry, which is where this kind of
+        # plan does the most damage.
+        candidates: list[tuple[float, str]] = [
+            (s["price"], "confirmed support") for s in supports if s["price"] < price]
+        candidates += [(ma, label) for ma, label in
+                       ((trend.ema20, "the 20 EMA"), (trend.ema50, "the 50 EMA"))
+                       if ma < price]
+        if not candidates:
+            notes.append("No confirmed support or moving average below the current "
+                         "price to anchor an entry on.")
+            return None, None, "stand aside", notes
+
+        anchor, source = max(candidates, key=lambda item: item[0])
+        notes.append(f"Anchored on {source} at {anchor:,.2f} — the first level price "
+                     f"would meet on a further dip.")
         return anchor - band, anchor + band, "wait for the pullback", notes
 
     return None, None, "stand aside", notes
@@ -393,18 +405,30 @@ def build_plan(trend: TrendState, decision: strat.Decision, supports: Sequence[d
     blockers: list[str] = []
     notes: list[str] = []
 
+    # Conditions that rule out any new long, whatever the entry would have been.
     if trend.regime_ok is False:
         blockers.append("Market regime is risk-off; the app's own gate vetoes new entries.")
     if trend.stage in ("declining", "repairing"):
         blockers.append(f"Trend stage is '{trend.stage}' — this is not a long setup.")
-    if trend.price < trend.sma_exit:
-        blockers.append(
-            f"Price {trend.price:,.2f} is below the {strategy_params.sma_exit} SMA "
-            f"{trend.sma_exit:,.2f}, which is the strategy's own exit line.")
 
     entry_low, entry_high, stance, entry_notes = _entry_zone(
         trend, decision, supports, params, strategy_params)
     notes.extend(entry_notes)
+
+    # Price under the exit average is a reason not to buy *today*. That is what a
+    # "wait for the pullback" plan already says, so treating it as a blocker there
+    # would refuse the most ordinary situation there is: a good chart that has
+    # dipped. It only contradicts a plan that wants filling now.
+    below_exit = trend.price < trend.sma_exit
+    if below_exit and stance == "buy now":
+        blockers.append(
+            f"Price {trend.price:,.2f} is below the {strategy_params.sma_exit} SMA "
+            f"{trend.sma_exit:,.2f}, which is the strategy's own exit line.")
+    elif below_exit:
+        notes.append(
+            f"Price {trend.price:,.2f} is under the {strategy_params.sma_exit} SMA "
+            f"{trend.sma_exit:,.2f} — which is why this is a level to wait for, "
+            f"not a fill to take now.")
 
     empty = TradePlan(
         action=decision.action.value, stance="stand aside",
@@ -427,11 +451,12 @@ def build_plan(trend: TrendState, decision: strat.Decision, supports: Sequence[d
         return empty
 
     above = [r["price"] for r in resistances if r["price"] > entry_mid]
+    t1_from_level = bool(above)
     if above:
         target1, t1_src = above[0], "next confirmed resistance"
     else:
-        target1 = entry_mid + params.min_reward_risk * risk
-        t1_src = f"no resistance overhead — {params.min_reward_risk:g}R projection"
+        target1 = entry_mid + params.tp1_r_multiple * risk
+        t1_src = f"no resistance overhead — {params.tp1_r_multiple:g}R projection"
     if len(above) > 1:
         target2, t2_src = above[1], "second confirmed resistance"
     else:
@@ -440,10 +465,18 @@ def build_plan(trend: TrendState, decision: strat.Decision, supports: Sequence[d
 
     rr1 = (target1 - entry_mid) / risk
     rr2 = (target2 - entry_mid) / risk
-    if rr1 < params.min_reward_risk:
-        blockers.append(
-            f"First target is only {rr1:.2f}R away (minimum {params.min_reward_risk:g}R) — "
-            f"resistance at {target1:,.2f} is too close to pay for the stop.")
+    # The reward:risk test only carries information when the target is a level the
+    # market put there. Against a projection it is circular — the number was chosen,
+    # so it passes by construction — and reporting it as a check would overstate
+    # what has been verified.
+    if t1_from_level:
+        if rr1 < params.min_reward_risk:
+            blockers.append(
+                f"First target is only {rr1:.2f}R away (minimum {params.min_reward_risk:g}R) — "
+                f"resistance at {target1:,.2f} is too close to pay for the stop.")
+    else:
+        notes.append("No confirmed resistance overhead, so the first target is a "
+                     "projection — its reward:risk is chosen, not verified.")
 
     ann_vol = sizing_mod.annualized_vol_from_atr(trend.atr, entry_mid)
     quantity = sizing_mod.target_quantity(
@@ -712,6 +745,12 @@ def render_analysis(analysis: StockAnalysis) -> str:
         for blocker in plan.blockers:
             lines.append(f"  ✗ {blocker}")
     if plan.entry_low is not None:
+        if plan.blockers:
+            # The levels below are still correct arithmetic, but a reader who takes
+            # the zone and skips the refusal above has done the one thing this
+            # report exists to prevent. Say so between the two.
+            lines.append("  The levels below are REFERENCE ONLY — the blockers above "
+                         "mean this is not a trade today.")
         lines += [
             f"  Buy zone         {_money(plan.entry_low)} – {_money(plan.entry_high)}",
             f"  Stop (sell)      {_money(plan.stop)}  "
@@ -766,7 +805,7 @@ NARRATOR_SYSTEM = (
     "what the stock is doing now; whether to buy and in what zone; where the stop and "
     "targets sit; and whether to keep holding it long term. Lead with anything in the "
     "'blockers' list — a refusal is a useful answer, and a plan with blockers must be "
-    "reported as no-trade rather than softened into a maybe. State the long-term verdict "
+    "reported as no-trade rather than softened into a maybe. When the report marks its levels REFERENCE ONLY, you must not present them as an entry to take. State the long-term verdict "
     "with how many criteria are unknown, so the reader knows how much it rests on.\n\n"
     "Be direct and brief. No disclaimers beyond the one already in the report."
 )

@@ -216,3 +216,17 @@ def test_narration_falls_back_to_the_computed_report_without_credentials(
     monkeypatch.setattr("config.AZURE_INFERENCE_CREDENTIAL", "", raising=False)
     analysis = _analyze(uptrend, risk_on)
     assert analyst.narrate(analysis) == analysis.render()
+
+
+def test_a_blocked_plan_marks_its_levels_reference_only(uptrend, risk_off):
+    """A reader who takes the zone and skips the refusal is the failure to prevent."""
+    analysis = _analyze(uptrend, risk_off)
+    assert analysis.plan.blockers
+    assert analysis.plan.entry_low is not None, "this case still computes levels"
+    report = analysis.render()
+    assert "REFERENCE ONLY" in report
+    assert report.index("✗") < report.index("REFERENCE ONLY") < report.index("Buy zone")
+
+
+def test_an_unblocked_plan_carries_no_reference_only_marker(uptrend, risk_on):
+    assert "REFERENCE ONLY" not in _analyze(uptrend, risk_on).render()
