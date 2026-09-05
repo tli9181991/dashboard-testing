@@ -7,6 +7,7 @@ from langchain_community.tools import DuckDuckGoSearchRun
 
 from config import AZURE_INFERENCE_ENDPOINT, AZURE_INFERENCE_CREDENTIAL, DEEPSEEK_MODEL_NAME
 import agent_tools
+import analyst
 
 def get_financial_agent():
     """Initializes a native LangChain tool-calling agent with memory, backed by
@@ -73,6 +74,23 @@ def get_financial_agent():
         return agent_tools.render_signal(agent_tools.check_signal_now(ticker))
 
     @tool
+    def analyze_stock(ticker: str, equity: float = 100000.0) -> str:
+        """FULL analysis of one stock in a single call: trend stage, moving averages,
+        volatility, 52-week position, relative strength, market regime, support and
+        resistance, a complete trade plan (buy zone, stop, two targets with their
+        reward:risk, position size) and a separate long-term hold verdict.
+
+        Use this FIRST whenever the user asks what to do with a stock — whether to
+        buy it, at what price, where to sell, what the target is, or whether to keep
+        holding it. Every number it returns is computed by this app's tested engines.
+        Report those numbers exactly as given: never adjust them, average them, or
+        derive new levels from them. If it reports blockers, the answer is no trade —
+        say so plainly instead of presenting the zone as a suggestion anyway."""
+        analysis = analyst.analyze(
+            ticker, analyst.AnalystParams(equity=equity))
+        return analysis.render()
+
+    @tool
     def get_support_resistance(ticker: str) -> str:
         """Confirmed support and resistance levels with their distance from the
         current price and how many times each was touched. These are the same
@@ -108,7 +126,7 @@ def get_financial_agent():
     tools = [
         get_stock_fundamentals, get_historical_performance, web_news_search,
         check_earnings, validate_trade_plan, check_signal_now,
-        get_support_resistance, size_position, random_entry_test,
+        analyze_stock, get_support_resistance, size_position, random_entry_test,
     ]
     llm = AzureAIChatCompletionsModel(
         endpoint=AZURE_INFERENCE_ENDPOINT,
@@ -122,10 +140,20 @@ def get_financial_agent():
         "You are a helpful financial assistant. Use tools to answer questions. "
         "Always rely on the tools for up-to-date information.\n\n"
         "Several tools compute over this dashboard's own tested engines: "
-        "check_signal_now, get_support_resistance, size_position, check_earnings, "
-        "validate_trade_plan and random_entry_test. Prefer them over your own "
-        "arithmetic or recollection — never estimate a signal, a level, a position "
-        "size or a backtest result yourself when a tool will compute it.\n\n"
+        "analyze_stock, check_signal_now, get_support_resistance, size_position, "
+        "check_earnings, validate_trade_plan and random_entry_test. Prefer them over "
+        "your own arithmetic or recollection — never estimate a signal, a level, a "
+        "position size or a backtest result yourself when a tool will compute it.\n\n"
+        "When the user asks what to do with a stock — buy it, at what price, where to "
+        "sell, what the target is, whether to keep holding — call analyze_stock first. "
+        "It returns the entry zone, stop, targets and size already computed. Copy those "
+        "numbers exactly; do not recalculate, round, average or extend them, and do not "
+        "invent a level the report does not contain. A price you produce yourself looks "
+        "identical to one the engine derived, which is what makes it dangerous.\n\n"
+        "Keep the two verdicts separate, because they answer different questions: the "
+        "trade plan is about entering now, the long-term view is about continuing to "
+        "hold. One can be no and the other yes. When the long-term basis is "
+        "'price only', say the verdict rests on the chart alone.\n\n"
         "Before endorsing a concrete trade, run validate_trade_plan and check_earnings. "
         "If either fails, say so plainly and do not recommend the trade: refusing is a "
         "legitimate and useful answer. If random_entry_test shows the rule does not "

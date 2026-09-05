@@ -64,6 +64,9 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 - `fundamentals.py`: Structured fundamentals from yfinance, treating a missing field as missing.
 - `assistant_charts.py`: Price chart with moving averages and labelled levels, drawn from the strategy's own level detection.
 - `swing_screener.py`: The Swing Universe Funnel — liquidity, tradability, regime, setups, events, sizing and ranking. Runs in the dashboard or as a CLI.
+- `analyst.py`: Whole-position analysis for one symbol — trend stage, levels, news,
+  a computed trade plan (buy zone, stop, targets, size) and a separate long-term
+  hold verdict. Every price is computed; the LLM only narrates.
 - `chat_agent.py`: LangChain tool-calling agent with conversational memory.
 - `sentiment.py`: AI-driven news scraper and sentiment evaluator.
 - `config.py`: Environment variable loading and global parameters.
@@ -98,6 +101,40 @@ Run the dashboard:
 ```bash
 streamlit run app.py
 ```
+
+## 🔎 Single-stock analyst
+
+`analyst.py` answers the questions you actually ask of a position — what is it doing,
+where would I buy, where do I sell, what is the target, should I keep holding it — by
+combining the engines already in the repo: `strategy` for the signal and levels, `regime`
+for the market gate, `sizing` for the size, `fundamentals` for the business and
+`sentiment` for the news.
+
+```bash
+python analyst.py AAPL --equity 50000            # full report
+python analyst.py AAPL --no-news --json          # machine-readable
+python analyst.py AAPL --narrate                 # LLM writes it up (needs Azure keys)
+```
+
+It is also a tool on the chat agent (`analyze_stock`), so the Assistant tab can answer
+"what should I do with AAPL" in one call.
+
+**The model never computes a number.** `analyze()` returns a plan in which every price
+was derived by tested code; `narrate()` hands that finished report to the LLM under
+instructions to explain it and invent nothing. An LLM asked for an entry price will
+always produce one, and it looks identical to a level derived from an ATR and confirmed
+support — which is exactly what makes it dangerous. Without Azure credentials you lose
+the prose, never the plan.
+
+Two verdicts come back separately, because they answer different questions:
+
+- **Trade plan** — entry zone, stop, two targets with their reward:risk, and the
+  vol-targeted size. Blockers (risk-off regime, price under the exit average, a first
+  target too close to pay for the stop) are reported as *no trade*, not softened into a
+  maybe, and no buy price is named at all when there isn't one worth naming.
+- **Long-term hold** — a separate rubric over trend, relative strength, profitability,
+  growth, balance sheet and news. Missing inputs count as unknown, never as a pass or a
+  fail, and a verdict reached from price alone is labelled `basis: price only`.
 
 ## 🔌 Interactive Brokers (optional)
 
