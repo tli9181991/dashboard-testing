@@ -83,12 +83,11 @@ def test_a_lookup_failure_is_reported_not_raised(monkeypatch):
 
 def test_an_empty_window_is_reported_rather_than_scored(patched, monkeypatch):
     """No news in two days is a real answer; a manufactured neutral is not."""
-    monkeypatch.setattr(sentiment, "AZURE_INFERENCE_ENDPOINT", "https://example")
-    monkeypatch.setattr(sentiment, "AZURE_INFERENCE_CREDENTIAL", "key")
+    monkeypatch.setattr(sentiment.llm_factory, "credentials_present", lambda: True)
     patched([_story(100), _story(200)])
 
     called = []
-    monkeypatch.setattr(sentiment, "AzureAIChatCompletionsModel",
+    monkeypatch.setattr(sentiment.llm_factory, "get_chat_model",
                         lambda **kw: called.append(kw))
 
     out = sentiment.get_recent_sentiment("AAA", days=2)
@@ -97,9 +96,8 @@ def test_an_empty_window_is_reported_rather_than_scored(patched, monkeypatch):
 
 
 def test_missing_credentials_are_reported_before_any_fetch(monkeypatch):
-    monkeypatch.setattr(sentiment, "AZURE_INFERENCE_ENDPOINT", "")
-    monkeypatch.setattr(sentiment, "AZURE_INFERENCE_CREDENTIAL", "")
-    assert "Missing Azure" in sentiment.get_recent_sentiment("AAA")["error"]
+    monkeypatch.setattr(sentiment.llm_factory, "credentials_present", lambda: False)
+    assert "Gemini API key" in sentiment.get_recent_sentiment("AAA")["error"]
 
 
 def test_prompt_text_renders_a_scored_window():

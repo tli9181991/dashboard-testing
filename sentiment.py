@@ -5,9 +5,8 @@ import yfinance as yf
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from pydantic import BaseModel, Field
-from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
 
-from config import AZURE_INFERENCE_ENDPOINT, AZURE_INFERENCE_CREDENTIAL, DEEPSEEK_MODEL_NAME
+import llm as llm_factory
 
 class NewsItem(BaseModel):
     ticker: str
@@ -34,8 +33,8 @@ class SectorAnalysisResult(BaseModel):
 SENTIMENT_SYSTEM = "You are a financial-news classification AI. Classify the news. Return structured JSON."
 
 def get_hourly_sentiment(ticker: str) -> dict:
-    if not AZURE_INFERENCE_ENDPOINT or not AZURE_INFERENCE_CREDENTIAL:
-        return {"error": "Missing Azure AI Foundry endpoint/credential (AZURE_INFERENCE_ENDPOINT / AZURE_INFERENCE_CREDENTIAL)."}
+    if not llm_factory.credentials_present():
+        return {"error": llm_factory.MISSING_CREDENTIALS}
 
     try: raw_items = yf.Ticker(ticker).news or []
     except Exception: raw_items = []
@@ -56,12 +55,7 @@ def get_hourly_sentiment(ticker: str) -> dict:
         
     if not news_list: return {"error": "No recent news found."}
 
-    llm = AzureAIChatCompletionsModel(
-        endpoint=AZURE_INFERENCE_ENDPOINT,
-        credential=AZURE_INFERENCE_CREDENTIAL,
-        model=DEEPSEEK_MODEL_NAME,
-        temperature=0.0,
-    )
+    llm = llm_factory.get_chat_model(temperature=0.0)
     structured_llm = llm.with_structured_output(SentimentResult)
     payload = [item.model_dump() for item in news_list]
     
@@ -128,9 +122,8 @@ def get_recent_sentiment(ticker: str, days: int = 2, max_items: int = 12) -> dic
     is a real and useful answer, and manufacturing a neutral reading from nothing
     would look identical to a genuine neutral reading on real coverage.
     """
-    if not AZURE_INFERENCE_ENDPOINT or not AZURE_INFERENCE_CREDENTIAL:
-        return {"error": "Missing Azure AI Foundry endpoint/credential "
-                         "(AZURE_INFERENCE_ENDPOINT / AZURE_INFERENCE_CREDENTIAL)."}
+    if not llm_factory.credentials_present():
+        return {"error": llm_factory.MISSING_CREDENTIALS}
 
     news = collect_recent_news(ticker, days=days, max_items=max_items)
     if news["error"]:
@@ -140,12 +133,7 @@ def get_recent_sentiment(ticker: str, days: int = 2, max_items: int = 12) -> dic
                          f"({news['stale']} older stories were skipped).",
                 "window": news}
 
-    llm = AzureAIChatCompletionsModel(
-        endpoint=AZURE_INFERENCE_ENDPOINT,
-        credential=AZURE_INFERENCE_CREDENTIAL,
-        model=DEEPSEEK_MODEL_NAME,
-        temperature=0.0,
-    )
+    llm = llm_factory.get_chat_model(temperature=0.0)
     structured_llm = llm.with_structured_output(SentimentResult)
     prompt = json.dumps({"ticker": ticker, "window_days": days,
                          "news": news["articles"]}, default=str)
@@ -179,13 +167,8 @@ def sentiment_prompt_text(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def analyze_sector_with_deepseek(sector_name: str, etf_ticker: str, top_stocks: list[str]) -> SectorAnalysisResult:
-    llm = AzureAIChatCompletionsModel(
-        endpoint=AZURE_INFERENCE_ENDPOINT,
-        credential=AZURE_INFERENCE_CREDENTIAL,
-        model=DEEPSEEK_MODEL_NAME,
-        temperature=0.0,
-    )
+def analyze_sector_with_gemini(sector_name: str, etf_ticker: str, top_stocks: list[str]) -> SectorAnalysisResult:
+    llm = llm_factory.get_chat_model(temperature=0.0)
     structured_llm = llm.with_structured_output(SectorAnalysisResult)
     
     prompt = f"Sector: {sector_name} ({etf_ticker})\nTop Stocks: {top_stocks}"

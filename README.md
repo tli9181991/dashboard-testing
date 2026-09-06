@@ -1,6 +1,6 @@
 # 🚀 AI-Powered Algorithmic Trading & Screening Dashboard
 
-A fully modular, multi-asset trading dashboard built with Python, Streamlit, and LangChain. This system integrates real-time price monitoring, S&P 500 technical screening, AI-driven news sentiment analysis, and an interactive financial chatbot powered by Google's Gemini 1.5 Flash.
+A fully modular, multi-asset trading dashboard built with Python, Streamlit, and LangChain. This system integrates real-time price monitoring, S&P 500 technical screening, AI-driven news sentiment analysis, and an interactive financial chatbot powered by Google's Gemini.
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.35%2B-red)
@@ -85,7 +85,8 @@ pip install -r requirements.txt
 Create a `.env` file for the AI features and risk defaults:
 
 ```
-GOOGLE_API_KEY=your_key_here
+GOOGLE_API_KEY=your_gemini_api_key
+GEMINI_MODEL_NAME=gemini-3.5-flash
 ACCOUNT_EQUITY=100000
 TARGET_VOL=0.15
 MAX_POSITION_PCT=0.25
