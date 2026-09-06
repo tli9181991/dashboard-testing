@@ -86,7 +86,7 @@ Create a `.env` file for the AI features and risk defaults:
 
 ```
 GOOGLE_API_KEY=your_gemini_api_key
-GEMINI_MODEL_NAME=gemini-3.5-flash
+GEMINI_MODEL_NAME=gemini-3.6-flash
 ACCOUNT_EQUITY=100000
 TARGET_VOL=0.15
 MAX_POSITION_PCT=0.25

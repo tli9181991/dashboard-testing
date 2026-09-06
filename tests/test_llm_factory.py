@@ -25,9 +25,9 @@ def test_building_without_a_key_raises_rather_than_half_building(monkeypatch):
 
 def test_the_model_carries_the_configured_name(monkeypatch):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
-    monkeypatch.setattr(llm_factory, "GEMINI_MODEL_NAME", "gemini-3.5-flash")
+    monkeypatch.setattr(llm_factory, "GEMINI_MODEL_NAME", "gemini-3.6-flash")
     model = llm_factory.get_chat_model()
-    assert "gemini-3.5-flash" in str(model.model)
+    assert "gemini-3.6-flash" in str(model.model)
 
 
 def test_an_explicit_model_overrides_the_default(monkeypatch):
@@ -198,7 +198,7 @@ def test_a_configured_model_missing_from_the_list_is_called_out(keyed, monkeypat
          "supportedGenerationMethods": ["generateContent"]},
     ]}))
     text = llm_factory.render_models(llm_factory.list_models(),
-                                     configured="gemini-3.5-flash")
+                                     configured="gemini-3.6-flash")
     assert "is NOT in the list" in text
     assert "gemini-2.5-flash" in text
     assert "Set GEMINI_MODEL_NAME" in text
@@ -216,3 +216,152 @@ def test_preview_and_experimental_models_are_not_suggested_as_the_fix(keyed, mon
     suggestion = text.split("Flash models available: ")[1].split("\n")[0]
     assert "gemini-2.5-flash" in suggestion
     assert "preview" not in suggestion
+
+
+# ---------------------------------------------------------------------------
+# Key doctor — "API key not valid" means a value was found and rejected
+# ---------------------------------------------------------------------------
+
+VALID_SHAPE = "AIza" + "b" * 35   # 39 chars, correct prefix
+
+
+def _in_dir(monkeypatch, tmp_path, env_text=None):
+    monkeypatch.chdir(tmp_path)
+    if env_text is not None:
+        (tmp_path / ".env").write_text(env_text)
+
+
+def test_a_shell_export_silently_beating_dotenv_is_caught(monkeypatch, tmp_path):
+    """load_dotenv does not override an exported variable, and nothing says so —
+    the app then uses a stale key while .env looks correct."""
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    stale = "AIza" + "z" * 35
+    monkeypatch.setenv("GOOGLE_API_KEY", stale)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", stale)
+
+    problems = " ".join(llm_factory.diagnose_key()["problems"])
+    assert "does NOT match the one in .env" in problems
+    assert "unset GOOGLE_API_KEY" in problems
+
+
+def test_a_matching_key_is_not_reported_as_overridden(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    assert llm_factory.diagnose_key()["problems"] == []
+
+
+def test_quotes_stripped_by_dotenv_are_not_flagged(monkeypatch, tmp_path):
+    """Regression: the raw file was inspected, so standard quoting — which
+    python-dotenv strips — produced a false alarm."""
+    _in_dir(monkeypatch, tmp_path, f'GOOGLE_API_KEY="{VALID_SHAPE}"\n')
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    assert llm_factory.diagnose_key()["problems"] == []
+
+
+def test_quotes_that_survive_into_the_value_are_flagged(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    quoted = f'"{VALID_SHAPE}"'
+    monkeypatch.setenv("GOOGLE_API_KEY", quoted)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", quoted)
+    assert any("wrapped in quotes" in p for p in llm_factory.diagnose_key()["problems"])
+
+
+def test_a_wrong_prefix_suggests_it_is_not_an_api_key(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GOOGLE_API_KEY", "ya29." + "x" * 34)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "ya29." + "x" * 34)
+    problems = " ".join(llm_factory.diagnose_key()["problems"])
+    assert "does not start with 'AIza'" in problems
+    assert "OAuth client id" in problems
+
+
+def test_a_truncated_key_is_caught_by_length(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaShort")
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "AIzaShort")
+    assert any("characters; Google API keys are 39" in p
+               for p in llm_factory.diagnose_key()["problems"])
+
+
+def test_whitespace_around_the_value_is_caught(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE + " ")
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE + " ")
+    assert any("whitespace" in p for p in llm_factory.diagnose_key()["problems"])
+
+
+def test_a_missing_env_file_is_reported(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "")
+    report = llm_factory.diagnose_key()
+    assert any("no .env file found" in f for f in report["findings"])
+
+
+def test_a_well_formed_key_says_the_loading_is_fine(monkeypatch, tmp_path):
+    """So a genuinely revoked key is not mistaken for a config problem."""
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
+    assert "Nothing wrong" in text
+    assert "invalid or revoked" in text
+
+
+def test_the_diagnosis_never_prints_the_key(monkeypatch, tmp_path):
+    """It reports shape — length, prefix, last four — and nothing more."""
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
+    assert VALID_SHAPE not in text
+    assert VALID_SHAPE[:20] not in text
+
+
+# ---------------------------------------------------------------------------
+# 403s that look alike and need different fixes
+# ---------------------------------------------------------------------------
+
+BLOCKED = ("Requests to this API generativelanguage.googleapis.com method "
+           "google.ai.generativelanguage.v1beta.ModelService.ListModels are blocked.")
+NOT_ENABLED = ("Generative Language API has not been used in project 12345 before "
+               "or it is disabled.")
+
+
+def test_a_key_restriction_is_named_as_such(keyed, monkeypatch):
+    """The key is valid; its allowed-API list just excludes this API. Saying
+    "check the key is valid" would send the user to rotate a working key."""
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": BLOCKED}}))
+    error = llm_factory.list_models()["error"]
+    assert "the key is fine" in error
+    assert "API restrictions" in error
+    assert "Don't restrict key" in error
+
+
+def test_a_disabled_api_gets_the_other_fix(keyed, monkeypatch):
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": NOT_ENABLED}}))
+    error = llm_factory.list_models()["error"]
+    assert "not enabled for this key's project" in error
+    assert "Library" in error
+
+
+def test_the_two_403s_do_not_get_the_same_advice(keyed, monkeypatch):
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": BLOCKED}}))
+    blocked = llm_factory.list_models()["error"]
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": NOT_ENABLED}}))
+    disabled = llm_factory.list_models()["error"]
+    assert blocked != disabled
+
+
+def test_an_unrecognised_403_still_gets_generic_advice(keyed, monkeypatch):
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": "something else"}}))
+    assert "Check the key is valid" in llm_factory.list_models()["error"]
+
+
+def test_an_invalid_key_is_not_treated_as_a_restriction(keyed, monkeypatch):
+    """A 400 on the key value must not send the user into the restrictions page."""
+    _patch_get(monkeypatch, _Response(400, {"error": {"message": "API key not valid"}}))
+    error = llm_factory.list_models()["error"]
+    assert "API key not valid" in error
+    assert "API restrictions" not in error

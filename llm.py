@@ -8,7 +8,12 @@ a provider migration turns into a scavenger hunt.
 Credentials come from ``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY``:
 ``langchain-google-genai`` reads the first from the environment itself, but both
 names are in common use and silently ignoring the one the user actually set is a
-bad first five minutes.
+bad first five minutes. The key is loaded from ``.env`` by ``config``, so nothing
+here needs a notebook-specific secrets store.
+
+``gemini-flash-latest`` is a valid alternative to a pinned id and always points at
+the current Flash model — convenient, at the cost of the model changing under you
+without a code change.
 """
 
 from __future__ import annotations
@@ -37,9 +42,12 @@ def get_chat_model(temperature: float = 0.0, model: str | None = None):
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
+    # `api_key` rather than `google_api_key`: the field carries both names, but
+    # this is the spelling in the snippet confirmed working against this key, and
+    # matching it exactly removes one variable from any future debugging.
     return ChatGoogleGenerativeAI(
         model=model or GEMINI_MODEL_NAME,
-        google_api_key=GOOGLE_API_KEY,
+        api_key=GOOGLE_API_KEY,
         temperature=temperature,
     )
 
@@ -77,10 +85,7 @@ def list_models(timeout: int = 20) -> dict:
             detail = response.json().get("error", {}).get("message", "")
         except Exception:
             detail = response.text[:200]
-        hint = ""
-        if response.status_code in (401, 403):
-            hint = (" Check the key is valid and that the Generative Language "
-                    "API is enabled for its project.")
+        hint = _http_hint(response.status_code, detail)
         return {"models": [],
                 "error": f"HTTP {response.status_code} listing models. {detail}{hint}"}
 
@@ -94,6 +99,41 @@ def list_models(timeout: int = 20) -> dict:
             "input_token_limit": entry.get("inputTokenLimit"),
         })
     return {"models": sorted(usable, key=lambda m: m["id"]), "error": ""}
+
+
+def _http_hint(status_code: int, detail: str) -> str:
+    """Turn Google's error into the specific console fix.
+
+    The two 403s look alike and have different remedies: a key whose *API
+    restriction* list excludes this API, versus an API that was never *enabled*
+    for the project. Google words them differently, so they can be told apart.
+    """
+    lowered = (detail or "").lower()
+
+    if "are blocked" in lowered or "api_key_service_blocked" in lowered:
+        return (
+            "\n\nThis is the API key's own restriction list, not the key's validity — "
+            "the key is fine, it is just not allowed to call this API.\n"
+            "Fix it in the Google Cloud console:\n"
+            "  1. APIs & Services > Library > enable 'Generative Language API'\n"
+            "     for this key's project. It must be enabled before it can be\n"
+            "     selected in step 2.\n"
+            "  2. APIs & Services > Credentials > your key > API restrictions:\n"
+            "     add 'Generative Language API' to the allowed list, or choose\n"
+            "     'Don't restrict key' to confirm the diagnosis quickly.\n"
+            "Restrictions can take a minute or two to propagate."
+        )
+
+    if "has not been used" in lowered or "is disabled" in lowered:
+        return (
+            "\n\nThe Generative Language API is not enabled for this key's project.\n"
+            "Enable it at APIs & Services > Library, then retry."
+        )
+
+    if status_code in (401, 403):
+        return (" Check the key is valid and that the Generative Language API is "
+                "enabled for its project.")
+    return ""
 
 
 def render_models(payload: dict, configured: str | None = None) -> str:
@@ -122,5 +162,113 @@ def render_models(payload: dict, configured: str | None = None) -> str:
     return "\n".join(lines)
 
 
+#: Google API keys are 39 characters and begin with this constant prefix.
+KEY_PREFIX = "AIza"
+KEY_LENGTH = 39
+
+
+def diagnose_key() -> dict:
+    """Why the key the app loaded might not be the key you think it is.
+
+    "API key not valid" means a value *was* found and Google rejected it, so the
+    useful questions are where it came from and what shape it is. Two traps this
+    catches:
+
+    * ``load_dotenv()`` does not override variables already exported in the shell,
+      so a stale export silently beats the .env file and nothing says so.
+    * A value copied with surrounding quotes or a trailing newline reaches the API
+      as a different string than the one on screen.
+
+    Reports shape only — length, prefix, last four — never the key.
+    """
+    import os
+    from pathlib import Path
+
+    findings: list[str] = []
+    problems: list[str] = []
+
+    env_path = None
+    for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"):
+        if candidate.exists():
+            env_path = candidate
+            break
+
+    file_values: dict[str, str] = {}
+    if env_path:
+        findings.append(f".env found at {env_path}")
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, raw = line.partition("=")
+            name = name.strip()
+            if name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+                file_values[name] = raw
+    else:
+        findings.append("no .env file found in the working directory")
+        problems.append("Create .env at the repo root, or export the key in your shell.")
+
+    loaded = GOOGLE_API_KEY
+    if not loaded:
+        findings.append("no key loaded")
+        problems.append("Neither GOOGLE_API_KEY nor GEMINI_API_KEY resolved to a value.")
+        return {"findings": findings, "problems": problems, "env_path": str(env_path or "")}
+
+    source = "GOOGLE_API_KEY" if os.environ.get("GOOGLE_API_KEY") else "GEMINI_API_KEY"
+    findings.append(f"key loaded from {source}: {len(loaded)} chars, ends …{loaded[-4:]}")
+
+    # The shell wins over .env, and that is exactly the silent failure.
+    for name, raw in file_values.items():
+        in_file = raw.strip().strip("\"'")
+        if in_file and in_file != loaded and os.environ.get(name):
+            problems.append(
+                f"The {name} the app is using does NOT match the one in .env. "
+                "load_dotenv() does not override a variable already exported in "
+                f"your shell, so the shell's stale value wins. Run: unset {name}"
+            )
+
+    if not loaded.startswith(KEY_PREFIX):
+        problems.append(
+            f"The key does not start with '{KEY_PREFIX}'. Google API keys do. "
+            "This may be an OAuth client id, a service-account credential, or a "
+            "truncated paste rather than an API key."
+        )
+    if len(loaded) != KEY_LENGTH:
+        problems.append(
+            f"The key is {len(loaded)} characters; Google API keys are {KEY_LENGTH}. "
+            "It looks truncated or to have picked up extra characters."
+        )
+    if loaded != loaded.strip():
+        problems.append("The loaded key has leading or trailing whitespace — check "
+                        "for a stray space or newline after the = in .env.")
+    if len(loaded) >= 2 and loaded[0] == loaded[-1] and loaded[0] in "\"'":
+        problems.append("The loaded key is still wrapped in quotes. python-dotenv "
+                        "strips standard quoting, so these came through some other "
+                        "way — remove them from .env.")
+
+    return {"findings": findings, "problems": problems, "env_path": str(env_path or "")}
+
+
+def render_diagnosis(report: dict) -> str:
+    lines = ["Key diagnosis:"]
+    lines += [f"  {f}" for f in report["findings"]]
+    if report["problems"]:
+        lines.append("")
+        lines.append("Problems found:")
+        lines += [f"  - {p}" for p in report["problems"]]
+    else:
+        lines.append("")
+        lines.append("  Nothing wrong with how the key is being loaded or its shape.")
+        lines.append("  If Google still rejects it, the key itself is invalid or "
+                     "revoked — rotate it in the console, or check the Generative "
+                     "Language API is enabled for its project.")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
-    print(render_models(list_models()))
+    payload = list_models()
+    print(render_models(payload))
+    # A rejected key is about the key, not the model list — say why.
+    if payload["error"]:
+        print()
+        print(render_diagnosis(diagnose_key()))
