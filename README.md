@@ -1,11 +1,11 @@
 # 🚀 AI-Powered Algorithmic Trading & Screening Dashboard
 
-A fully modular, multi-asset trading dashboard built with Python, Streamlit, and LangChain. This system integrates real-time price monitoring, S&P 500 technical screening, AI-driven news sentiment analysis, and an interactive financial chatbot powered by Google's Gemini.
+A fully modular, multi-asset trading dashboard built with Python, Streamlit, and LangChain. This system integrates real-time price monitoring, S&P 500 technical screening, AI-driven news sentiment analysis, and an interactive financial chatbot. The chatbot runs on either DeepSeek V4 Flash (Azure AI Foundry) or Google Gemini, switchable from the sidebar while the app is running.
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.35%2B-red)
 ![LangChain](https://img.shields.io/badge/LangChain-Latest-green)
-![Gemini AI](https://img.shields.io/badge/Gemini-1.5_Flash-orange)
+![LLM](https://img.shields.io/badge/LLM-DeepSeek_V4_Flash_%7C_Gemini-orange)
 
 ## 🌟 Key Features
 
@@ -38,7 +38,7 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 
 5. **🧠 AI Sector & News Sentiment**
    - Fetches the latest market news for your portfolio assets.
-   - Leverages Google Gemini to synthesize news and generate an aggregated sentiment score and label (Bullish, Bearish, Neutral).
+   - Leverages the selected LLM to synthesize news and generate an aggregated sentiment score and label (Bullish, Bearish, Neutral).
 
 6. **💬 AI Financial Assistant (LangChain)**
    - A custom tool-calling agent equipped with `yfinance` and DuckDuckGo Web Search.
@@ -82,16 +82,38 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file for the AI features and risk defaults:
+Create a `.env` file for the AI features and risk defaults. `.env.example` is a
+commented template of every variable the app reads; copy it and fill in the
+provider you use.
 
 ```
+# Which LLM the AI features talk to: deepseek (default) or gemini.
+# The sidebar switches this for a running session; this sets the starting value.
+LLM_PROVIDER=deepseek
+
+# Needed when LLM_PROVIDER=deepseek
+AZURE_INFERENCE_ENDPOINT=https://<your-resource>.services.ai.azure.com/openai/v1
+AZURE_INFERENCE_CREDENTIAL=your_azure_ai_foundry_key
+DEEPSEEK_MODEL_NAME=DeepSeek-V4-Flash
+
+# Needed when LLM_PROVIDER=gemini
 GOOGLE_API_KEY=your_gemini_api_key
 GEMINI_MODEL_NAME=gemini-3.6-flash
+
 ACCOUNT_EQUITY=100000
 TARGET_VOL=0.15
 MAX_POSITION_PCT=0.25
 USE_REGIME_GATE=true
 REGIME_BENCHMARK=^GSPC
+```
+
+Only the selected provider's credentials are required. Without any, the charts,
+screeners and backtests still work; the AI features say which variable is
+missing. To check the settings the app actually loaded:
+
+```bash
+python llm.py                        # diagnoses the active provider
+LLM_PROVIDER=gemini python llm.py    # plus the model ids the Gemini key can call
 ```
 
 Run the dashboard:

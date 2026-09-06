@@ -9,7 +9,7 @@ import agent_tools
 
 def get_financial_agent():
     """Initializes a native LangChain tool-calling agent with memory, backed by
-    Gemini via langchain-google-genai."""
+    whichever provider ``llm.active_provider()`` currently names."""
     if not llm_factory.credentials_present():
         return None
 

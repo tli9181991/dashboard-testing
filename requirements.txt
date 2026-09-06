@@ -20,7 +20,10 @@ pytz
 # AI features
 langchain
 langchain-community
-langchain-google-genai
+# Both LLM providers ship: the sidebar switches between them at runtime, so
+# whichever one is not selected still has to import.
+langchain-azure-ai        # DeepSeek V4 Flash on Azure AI Foundry
+langchain-google-genai    # Gemini
 duckduckgo-search
 pydantic
 ddgs

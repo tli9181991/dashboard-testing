@@ -34,7 +34,7 @@ SENTIMENT_SYSTEM = "You are a financial-news classification AI. Classify the new
 
 def get_hourly_sentiment(ticker: str) -> dict:
     if not llm_factory.credentials_present():
-        return {"error": llm_factory.MISSING_CREDENTIALS}
+        return {"error": llm_factory.missing_credentials_message()}
 
     try: raw_items = yf.Ticker(ticker).news or []
     except Exception: raw_items = []
@@ -123,7 +123,7 @@ def get_recent_sentiment(ticker: str, days: int = 2, max_items: int = 12) -> dic
     would look identical to a genuine neutral reading on real coverage.
     """
     if not llm_factory.credentials_present():
-        return {"error": llm_factory.MISSING_CREDENTIALS}
+        return {"error": llm_factory.missing_credentials_message()}
 
     news = collect_recent_news(ticker, days=days, max_items=max_items)
     if news["error"]:

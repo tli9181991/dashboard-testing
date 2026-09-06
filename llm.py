@@ -5,40 +5,130 @@ through ``get_chat_model`` so the provider, model name and credential are decide
 once. Before this the constructor was copy-pasted at four call sites, which is how
 a provider migration turns into a scavenger hunt.
 
-Credentials come from ``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY``:
-``langchain-google-genai`` reads the first from the environment itself, but both
-names are in common use and silently ignoring the one the user actually set is a
-bad first five minutes. The key is loaded from ``.env`` by ``config``, so nothing
-here needs a notebook-specific secrets store.
+Two providers are supported and either can be the active one:
 
-``gemini-flash-latest`` is a valid alternative to a pinned id and always points at
-the current Flash model — convenient, at the cost of the model changing under you
-without a code change.
+* ``deepseek`` — DeepSeek V4 Flash on Azure AI Foundry, via
+  ``AZURE_INFERENCE_ENDPOINT`` and ``AZURE_INFERENCE_CREDENTIAL``.
+* ``gemini`` — Google's Gemini, via ``GOOGLE_API_KEY`` (or ``GEMINI_API_KEY``).
+
+``LLM_PROVIDER`` in ``.env`` picks the default; ``set_provider`` overrides it for
+the running process, which is what the dashboard's sidebar switch uses. Nothing
+else in the app names a provider, so a switch is one call rather than an edit
+across four modules.
 """
 
 from __future__ import annotations
 
-from config import GEMINI_MODEL_NAME, GOOGLE_API_KEY
-
-MISSING_CREDENTIALS = (
-    "Missing Gemini API key. Set GOOGLE_API_KEY (or GEMINI_API_KEY) in your .env file."
+from config import (
+    AZURE_INFERENCE_CREDENTIAL,
+    AZURE_INFERENCE_ENDPOINT,
+    DEEPSEEK_MODEL_NAME,
+    GEMINI_MODEL_NAME,
+    GOOGLE_API_KEY,
+    LLM_PROVIDER,
 )
 
+DEEPSEEK = "deepseek"
+GEMINI = "gemini"
+PROVIDERS = (DEEPSEEK, GEMINI)
 
-def credentials_present() -> bool:
+LABELS = {
+    DEEPSEEK: "DeepSeek V4 Flash (Azure AI Foundry)",
+    GEMINI: "Gemini (Google AI)",
+}
+
+#: Overrides LLM_PROVIDER for this process. Streamlit re-runs the script on every
+#: interaction, so a sidebar selector calling this is enough to switch provider
+#: for the whole app without threading a parameter through every call site.
+_override: str | None = None
+
+
+def set_provider(name: str | None) -> str:
+    """Point the app at a provider for the rest of this process."""
+    global _override
+    if name is None:
+        _override = None
+        return active_provider()
+    cleaned = str(name).strip().lower()
+    if cleaned not in PROVIDERS:
+        raise ValueError(f"Unknown provider {name!r}. Use one of {', '.join(PROVIDERS)}.")
+    _override = cleaned
+    return cleaned
+
+
+def active_provider() -> str:
+    """The provider in force: the sidebar override, else LLM_PROVIDER."""
+    if _override in PROVIDERS:
+        return _override
+    return LLM_PROVIDER if LLM_PROVIDER in PROVIDERS else DEEPSEEK
+
+
+def _resolve(provider: str | None) -> str:
+    if provider is None:
+        return active_provider()
+    cleaned = str(provider).strip().lower()
+    if cleaned not in PROVIDERS:
+        raise ValueError(f"Unknown provider {provider!r}. Use one of {', '.join(PROVIDERS)}.")
+    return cleaned
+
+
+def active_model(provider: str | None = None) -> str:
+    return DEEPSEEK_MODEL_NAME if _resolve(provider) == DEEPSEEK else GEMINI_MODEL_NAME
+
+
+def label(provider: str | None = None) -> str:
+    return LABELS[_resolve(provider)]
+
+
+def credentials_present(provider: str | None = None) -> bool:
+    if _resolve(provider) == DEEPSEEK:
+        return bool(AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL)
     return bool(GOOGLE_API_KEY)
 
 
-def get_chat_model(temperature: float = 0.0, model: str | None = None):
-    """A configured Gemini chat model, or raise if there is no key.
+def missing_credentials_message(provider: str | None = None) -> str:
+    """Name the variables *this* provider needs, not a generic complaint."""
+    if _resolve(provider) == DEEPSEEK:
+        return ("Missing Azure AI Foundry credentials for DeepSeek. Set "
+                "AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL in your "
+                ".env file, or switch LLM_PROVIDER to gemini.")
+    return ("Missing Gemini API key. Set GOOGLE_API_KEY (or GEMINI_API_KEY) in "
+            "your .env file, or switch LLM_PROVIDER to deepseek.")
+
+
+#: Kept so existing callers importing the constant still read something sensible;
+#: prefer missing_credentials_message(), which follows the active provider.
+MISSING_CREDENTIALS = missing_credentials_message()
+
+
+def describe(provider: str | None = None) -> str:
+    resolved = _resolve(provider)
+    state = "configured" if credentials_present(resolved) else "NOT configured"
+    return f"{LABELS[resolved]} · {active_model(resolved)} · {state}"
+
+
+def get_chat_model(temperature: float = 0.0, model: str | None = None,
+                   provider: str | None = None):
+    """A configured chat model, or raise if this provider has no credentials.
 
     Callers that surface a friendly message should check ``credentials_present``
     first; this raises rather than returning a half-built client, because a model
     object that fails on first use is harder to diagnose than one that never
     existed.
     """
-    if not credentials_present():
-        raise RuntimeError(MISSING_CREDENTIALS)
+    resolved = _resolve(provider)
+    if not credentials_present(resolved):
+        raise RuntimeError(missing_credentials_message(resolved))
+
+    if resolved == DEEPSEEK:
+        from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
+
+        return AzureAIChatCompletionsModel(
+            endpoint=AZURE_INFERENCE_ENDPOINT,
+            credential=AZURE_INFERENCE_CREDENTIAL,
+            model=model or DEEPSEEK_MODEL_NAME,
+            temperature=temperature,
+        )
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -50,6 +140,7 @@ def get_chat_model(temperature: float = 0.0, model: str | None = None):
         api_key=GOOGLE_API_KEY,
         temperature=temperature,
     )
+
 
 MODELS_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -63,8 +154,8 @@ def list_models(timeout: int = 20) -> dict:
     Returns ``{"models": [...], "error": ""}``; ``models`` holds only the ids that
     support ``generateContent``, which is the method every feature here uses.
     """
-    if not credentials_present():
-        return {"models": [], "error": MISSING_CREDENTIALS}
+    if not credentials_present(GEMINI):
+        return {"models": [], "error": missing_credentials_message(GEMINI)}
 
     import requests
 
@@ -249,26 +340,85 @@ def diagnose_key() -> dict:
     return {"findings": findings, "problems": problems, "env_path": str(env_path or "")}
 
 
-def render_diagnosis(report: dict) -> str:
-    lines = ["Key diagnosis:"]
+#: What render_diagnosis says when it finds nothing wrong. Per provider, because
+#: "your settings look fine" is only useful if it also says where to look next.
+ALL_CLEAR = {
+    GEMINI: ("Nothing wrong with how the key is being loaded or its shape.\n"
+             "  If Google still rejects it, the key itself is invalid or revoked — "
+             "rotate it in the console, or check the Generative Language API is "
+             "enabled for its project."),
+    DEEPSEEK: ("Endpoint and credential are both set and plausibly shaped.\n"
+               "  Whether they work is only answered by a real call — start the app "
+               "and ask the assistant something."),
+}
+
+
+def render_diagnosis(report: dict, provider: str | None = None) -> str:
+    resolved = _resolve(provider)
+    lines = [f"{LABELS[resolved]} diagnosis:"]
     lines += [f"  {f}" for f in report["findings"]]
+    lines.append("")
     if report["problems"]:
-        lines.append("")
         lines.append("Problems found:")
         lines += [f"  - {p}" for p in report["problems"]]
     else:
-        lines.append("")
-        lines.append("  Nothing wrong with how the key is being loaded or its shape.")
-        lines.append("  If Google still rejects it, the key itself is invalid or "
-                     "revoked — rotate it in the console, or check the Generative "
-                     "Language API is enabled for its project.")
+        lines.append("  " + ALL_CLEAR[resolved])
     return "\n".join(lines)
 
 
+def diagnose_deepseek() -> dict:
+    """Whether the Azure AI Foundry settings are present and shaped plausibly.
+
+    Azure has no cheap "list what this credential can call" endpoint the way the
+    Gemini API does, so this checks only what can be checked without spending a
+    request: that both values exist, and that the endpoint is the inference URL
+    rather than one of the neighbouring URLs the portal also shows.
+    """
+    findings: list[str] = []
+    problems: list[str] = []
+
+    if not AZURE_INFERENCE_ENDPOINT:
+        problems.append("AZURE_INFERENCE_ENDPOINT is not set.")
+    else:
+        findings.append(f"endpoint: {AZURE_INFERENCE_ENDPOINT}")
+        if not AZURE_INFERENCE_ENDPOINT.startswith("https://"):
+            problems.append("The endpoint does not start with https:// — copy the "
+                            "deployment's Target URI verbatim.")
+        # langchain-azure-ai now routes on the endpoint's shape and warns when a
+        # services.ai endpoint has no version segment. Said here rather than left
+        # to a runtime warning nobody reads.
+        if ("services.ai.azure.com" in AZURE_INFERENCE_ENDPOINT
+                and "/v1" not in AZURE_INFERENCE_ENDPOINT):
+            problems.append("An AI Foundry endpoint should end with /openai/v1 "
+                            "(the OpenAI-compatible route). Without a version "
+                            "segment the SDK warns and may pick the wrong client.")
+
+    if not AZURE_INFERENCE_CREDENTIAL:
+        problems.append("AZURE_INFERENCE_CREDENTIAL is not set.")
+    else:
+        cred = AZURE_INFERENCE_CREDENTIAL
+        findings.append(f"credential: {len(cred)} chars, ends …{cred[-4:]}")
+        if cred != cred.strip():
+            problems.append("The credential has leading or trailing whitespace.")
+
+    findings.append(f"model / deployment name: {DEEPSEEK_MODEL_NAME}")
+    return {"findings": findings, "problems": problems, "env_path": ""}
+
+
 if __name__ == "__main__":
-    payload = list_models()
-    print(render_models(payload))
-    # A rejected key is about the key, not the model list — say why.
-    if payload["error"]:
+    provider = active_provider()
+    print(describe(provider))
+    print()
+
+    if provider == DEEPSEEK:
+        print(render_diagnosis(diagnose_deepseek(), DEEPSEEK))
         print()
-        print(render_diagnosis(diagnose_key()))
+        print("Model discovery is Gemini-only. To check the Gemini side instead:")
+        print("  LLM_PROVIDER=gemini python llm.py")
+    else:
+        payload = list_models()
+        print(render_models(payload))
+        # A rejected key is about the key, not the model list — say why.
+        if payload["error"]:
+            print()
+            print(render_diagnosis(diagnose_key(), GEMINI))

@@ -5,17 +5,145 @@ import pytest
 import llm as llm_factory
 
 
-def test_no_key_means_no_credentials(monkeypatch):
+@pytest.fixture(autouse=True)
+def no_leaked_provider():
+    """set_provider writes a module global, so a test that switches provider
+    would otherwise decide the outcome of every test after it."""
+    yield
+    llm_factory.set_provider(None)
+
+
+@pytest.fixture
+def on_gemini():
+    llm_factory.set_provider("gemini")
+
+
+@pytest.fixture
+def on_deepseek():
+    llm_factory.set_provider("deepseek")
+
+
+# ---------------------------------------------------------------------------
+# Two providers, one switch
+# ---------------------------------------------------------------------------
+
+def test_deepseek_is_the_default(monkeypatch):
+    """The switch defaults to DeepSeek; LLM_PROVIDER in .env moves it."""
+    monkeypatch.setattr(llm_factory, "LLM_PROVIDER", "deepseek")
+    assert llm_factory.active_provider() == "deepseek"
+
+
+def test_an_unset_or_junk_provider_still_starts_the_app(monkeypatch):
+    """A typo in .env must not be a crash on import — fall back, do not fail."""
+    monkeypatch.setattr(llm_factory, "LLM_PROVIDER", "gemeni")
+    assert llm_factory.active_provider() == "deepseek"
+
+
+def test_the_switch_overrides_the_configured_default(monkeypatch):
+    monkeypatch.setattr(llm_factory, "LLM_PROVIDER", "deepseek")
+    llm_factory.set_provider("gemini")
+    assert llm_factory.active_provider() == "gemini"
+
+
+def test_the_switch_can_be_cleared_back_to_the_configured_default(monkeypatch):
+    monkeypatch.setattr(llm_factory, "LLM_PROVIDER", "gemini")
+    llm_factory.set_provider("deepseek")
+    llm_factory.set_provider(None)
+    assert llm_factory.active_provider() == "gemini"
+
+
+def test_an_unknown_provider_is_refused_not_silently_ignored():
+    """Silently ignoring it would leave the sidebar showing one model while the
+    app called another."""
+    with pytest.raises(ValueError, match="Unknown provider"):
+        llm_factory.set_provider("chatgpt")
+
+
+def test_each_provider_reports_its_own_model_and_label():
+    assert llm_factory.active_model("deepseek") == llm_factory.DEEPSEEK_MODEL_NAME
+    assert llm_factory.active_model("gemini") == llm_factory.GEMINI_MODEL_NAME
+    assert llm_factory.label("deepseek") != llm_factory.label("gemini")
+
+
+def test_credentials_are_judged_per_provider(monkeypatch):
+    """A Gemini key must not make the app claim DeepSeek is ready, and the
+    reverse — this is what makes switching provider surface a missing key."""
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_ENDPOINT", "")
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_CREDENTIAL", "")
+    assert llm_factory.credentials_present("gemini") is True
+    assert llm_factory.credentials_present("deepseek") is False
+
+
+def test_the_missing_credential_message_names_that_provider_s_variables():
+    """"Not configured" is not actionable; the variable to set is."""
+    deepseek = llm_factory.missing_credentials_message("deepseek")
+    gemini = llm_factory.missing_credentials_message("gemini")
+    assert "AZURE_INFERENCE_ENDPOINT" in deepseek and "GOOGLE_API_KEY" not in deepseek
+    assert "GOOGLE_API_KEY" in gemini and "AZURE_INFERENCE" not in gemini
+
+
+def test_deepseek_needs_both_endpoint_and_credential(monkeypatch):
+    """Either one alone builds a client that fails on first call."""
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_ENDPOINT", "https://x/models")
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_CREDENTIAL", "")
+    assert llm_factory.credentials_present("deepseek") is False
+
+
+def test_the_switch_decides_which_client_is_built(monkeypatch, on_deepseek):
+    """The whole point of the switch: same call site, different SDK object."""
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_ENDPOINT",
+                        "https://example.services.ai.azure.com/openai/v1")
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_CREDENTIAL", "azure-key")
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
+
+    # Matched loosely: langchain-azure-ai returns one of several Azure classes
+    # depending on the endpoint's shape, and pinning the exact one would fail on
+    # an SDK upgrade that changes nothing we depend on.
+    assert "Azure" in type(llm_factory.get_chat_model()).__name__
+    llm_factory.set_provider("gemini")
+    assert type(llm_factory.get_chat_model()).__name__ == "ChatGoogleGenerativeAI"
+
+
+def test_a_provider_can_be_named_per_call_without_moving_the_switch(monkeypatch,
+                                                                    on_deepseek):
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
+    model = llm_factory.get_chat_model(provider="gemini")
+    assert type(model).__name__ == "ChatGoogleGenerativeAI"
+    assert llm_factory.active_provider() == "deepseek"
+
+
+def test_deepseek_carries_its_deployment_name(monkeypatch, on_deepseek):
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_ENDPOINT",
+                        "https://example.services.ai.azure.com/openai/v1")
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_CREDENTIAL", "azure-key")
+    monkeypatch.setattr(llm_factory, "DEEPSEEK_MODEL_NAME", "DeepSeek-V4-Flash")
+    assert "DeepSeek-V4-Flash" in str(llm_factory.get_chat_model().model_name)
+
+
+def test_building_deepseek_without_credentials_raises(on_deepseek, monkeypatch):
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_ENDPOINT", "")
+    monkeypatch.setattr(llm_factory, "AZURE_INFERENCE_CREDENTIAL", "")
+    with pytest.raises(RuntimeError, match="AZURE_INFERENCE_ENDPOINT"):
+        llm_factory.get_chat_model()
+
+
+# ---------------------------------------------------------------------------
+# Gemini
+# ---------------------------------------------------------------------------
+
+def test_no_key_means_no_credentials(monkeypatch, on_gemini):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "")
     assert llm_factory.credentials_present() is False
 
 
-def test_a_key_means_credentials(monkeypatch):
+def test_a_key_means_credentials(monkeypatch, on_gemini):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
     assert llm_factory.credentials_present() is True
 
 
-def test_building_without_a_key_raises_rather_than_half_building(monkeypatch):
+def test_building_without_a_key_raises_rather_than_half_building(monkeypatch,
+                                                                 on_gemini):
     """A model object that fails on first use is harder to diagnose than one
     that never existed."""
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "")
@@ -23,20 +151,20 @@ def test_building_without_a_key_raises_rather_than_half_building(monkeypatch):
         llm_factory.get_chat_model()
 
 
-def test_the_model_carries_the_configured_name(monkeypatch):
+def test_the_model_carries_the_configured_name(monkeypatch, on_gemini):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
     monkeypatch.setattr(llm_factory, "GEMINI_MODEL_NAME", "gemini-3.6-flash")
     model = llm_factory.get_chat_model()
     assert "gemini-3.6-flash" in str(model.model)
 
 
-def test_an_explicit_model_overrides_the_default(monkeypatch):
+def test_an_explicit_model_overrides_the_default(monkeypatch, on_gemini):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
     model = llm_factory.get_chat_model(model="gemini-2.5-flash")
     assert "gemini-2.5-flash" in str(model.model)
 
 
-def test_temperature_is_passed_through(monkeypatch):
+def test_temperature_is_passed_through(monkeypatch, on_gemini):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
     assert llm_factory.get_chat_model(temperature=0.7).temperature == 0.7
 
@@ -73,30 +201,38 @@ def test_the_model_name_is_configurable(monkeypatch):
     assert config.GEMINI_MODEL_NAME == "gemini-9-turbo"
 
 
-def test_nothing_in_the_source_still_reaches_for_azure():
-    import pathlib
-
-    offenders = []
-    for path in pathlib.Path(".").glob("*.py"):
-        text = path.read_text()
-        if "AZURE_INFERENCE" in text or "AzureAIChatCompletionsModel" in text:
-            offenders.append(path.name)
-    assert not offenders, offenders
-
-
 def test_every_llm_call_site_goes_through_the_factory():
     """Before this the constructor was copy-pasted at four sites, which is how a
-    provider migration turns into a scavenger hunt."""
+    provider migration turns into a scavenger hunt — and it is what makes one
+    sidebar switch able to redirect every AI feature at once."""
     import pathlib
     import re
 
+    constructors = r"(ChatGoogleGenerativeAI|AzureAIChatCompletionsModel)\s*\("
     direct = []
     for path in pathlib.Path(".").glob("*.py"):
         if path.name == "llm.py":
             continue
-        if re.search(r"ChatGoogleGenerativeAI\s*\(", path.read_text()):
+        if re.search(constructors, path.read_text()):
             direct.append(path.name)
     assert not direct, f"these build the model directly instead of via llm.py: {direct}"
+
+
+def test_no_module_hard_codes_a_provider_s_settings():
+    """A module reading AZURE_INFERENCE_* or GOOGLE_API_KEY straight from config
+    is a call site the switch cannot move."""
+    import pathlib
+
+    names = ("AZURE_INFERENCE_ENDPOINT", "AZURE_INFERENCE_CREDENTIAL",
+             "GOOGLE_API_KEY", "GEMINI_API_KEY")
+    offenders = []
+    for path in pathlib.Path(".").glob("*.py"):
+        if path.name in ("llm.py", "config.py"):
+            continue
+        text = path.read_text()
+        if any(name in text for name in names):
+            offenders.append(path.name)
+    assert not offenders, f"these bypass llm.py's provider dispatch: {offenders}"
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +250,7 @@ class _Response:
 
 
 @pytest.fixture
-def keyed(monkeypatch):
+def keyed(monkeypatch, on_gemini):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
 
 
@@ -123,7 +259,9 @@ def _patch_get(monkeypatch, response):
     monkeypatch.setattr(requests, "get", lambda *a, **k: response)
 
 
-def test_listing_without_a_key_reports_that(monkeypatch):
+def test_listing_without_a_key_reports_that(monkeypatch, on_deepseek):
+    """Model discovery is Gemini's API whichever provider is selected, so it
+    must ask about the Gemini key rather than the active provider's."""
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "")
     out = llm_factory.list_models()
     assert out["models"] == []
@@ -304,7 +442,7 @@ def test_a_well_formed_key_says_the_loading_is_fine(monkeypatch, tmp_path):
     _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
     monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
-    text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
+    text = llm_factory.render_diagnosis(llm_factory.diagnose_key(), "gemini")
     assert "Nothing wrong" in text
     assert "invalid or revoked" in text
 
@@ -314,7 +452,7 @@ def test_the_diagnosis_never_prints_the_key(monkeypatch, tmp_path):
     _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
     monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
-    text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
+    text = llm_factory.render_diagnosis(llm_factory.diagnose_key(), "gemini")
     assert VALID_SHAPE not in text
     assert VALID_SHAPE[:20] not in text
 
