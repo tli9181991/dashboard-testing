@@ -68,6 +68,10 @@ A fully modular, multi-asset trading dashboard built with Python, Streamlit, and
 - `sentiment.py`: AI-driven news scraper and sentiment evaluator.
 - `config.py`: Environment variable loading and global parameters.
 - `portfolio.csv`: Local state for active holdings.
+- `notebooks/qqq_top20_max_sharpe_backtest.ipynb`: Back-tests a monthly-rebalanced portfolio —
+  the screener's top 20 Nasdaq-100 names, weighted for maximum Sharpe — against buy-and-hold
+  QQQ and BOXX. Calls `screening.evaluate_ticker` point-in-time, so the selection is the
+  dashboard's, not a copy of it.
 - `notebooks/ib_tws_connect.ipynb`: Connects to Interactive Brokers TWS/Gateway and pulls
   account summary, historical bars, quotes and positions; can write those bars into the
   `.screen_cache/` layout `data.load_history` reads.
