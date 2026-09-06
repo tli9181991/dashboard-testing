@@ -10,7 +10,16 @@ def parse_bool(val: str, default: bool) -> bool:
         return default
     return str(val).lower() in ("true", "1", "yes", "y", "t")
 
-# API Keys & Defaults
+# ── Which LLM the app talks to ───────────────────────────────────────────────
+# "deepseek" (DeepSeek V4 Flash on Azure AI Foundry) or "gemini". The sidebar can
+# override this per session; this is the value it starts from.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
+
+# DeepSeek on Azure AI Foundry
+AZURE_INFERENCE_ENDPOINT = os.getenv("AZURE_INFERENCE_ENDPOINT", "")
+AZURE_INFERENCE_CREDENTIAL = os.getenv("AZURE_INFERENCE_CREDENTIAL", "")
+DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "DeepSeek-V4-Flash")
+
 # Gemini. GOOGLE_API_KEY is what langchain-google-genai reads by default;
 # GEMINI_API_KEY is accepted too, because both names are in common use and
 # silently ignoring the one that was actually set is a bad first five minutes.

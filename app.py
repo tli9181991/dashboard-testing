@@ -35,6 +35,7 @@ from strategy import AssetClass
 from sentiment import get_hourly_sentiment, get_recent_sentiment, sentiment_prompt_text
 from screening import get_or_create_sector_stocks
 from chat_agent import get_financial_agent
+import llm as llm_factory
 
 # =============================================================================
 # Helper Functions
@@ -354,6 +355,29 @@ st.sidebar.header("Agent Settings")
 refresh_rate = st.sidebar.slider("Refresh Interval (s)", 5, 300, 30)
 force_data_refresh = st.sidebar.button("🔄 Force Refresh Market Data")
 auto_refresh_paused = st.sidebar.checkbox("⏸️ Pause Auto-Refresh (Turn on when chatting)")
+
+# ── Which LLM every AI feature talks to ──────────────────────────────────────
+# One switch rather than one per tab: the assistant agent, the news sentiment
+# reader and the sector commentary all build their model through llm.py, so
+# setting the provider here redirects all of them. Streamlit re-runs this script
+# on every interaction, which is why the call is unconditional — it re-applies
+# the selection on each run rather than relying on it having stuck.
+st.sidebar.header("Model")
+_providers = list(llm_factory.PROVIDERS)
+_llm_choice = st.sidebar.selectbox(
+    "LLM in use",
+    _providers,
+    index=_providers.index(llm_factory.active_provider()),
+    format_func=llm_factory.label,
+    help="LLM_PROVIDER in .env decides which one is selected at startup.",
+)
+llm_factory.set_provider(_llm_choice)
+if llm_factory.credentials_present():
+    st.sidebar.caption(f"✅ {llm_factory.active_model()}")
+else:
+    # Named variables, not "not configured": switching provider is the moment a
+    # missing key shows up, and the fix is a specific line in .env.
+    st.sidebar.warning(llm_factory.missing_credentials_message())
 
 st.sidebar.header("Risk")
 account_equity = st.sidebar.number_input("Account Equity ($)", value=float(ACCOUNT_EQUITY), min_value=1000.0, step=1000.0)
@@ -1225,7 +1249,7 @@ if SHOW_TAB_SENTIMENT:
         sentiment_ticker = st.selectbox("Select Asset for AI Analysis:", monitored_tickers, key="sentiment_box")
         st.subheader(f"AI News Synthesis ({sentiment_ticker})")
         
-        # Auth is read from GOOGLE_API_KEY / GEMINI_API_KEY in config.py
+        # Auth for the active provider is read in config.py; see the sidebar switch.
         sentiment_payload = get_hourly_sentiment(sentiment_ticker)
                 
         if "error" in sentiment_payload:
@@ -1534,8 +1558,7 @@ if SHOW_TAB_ASSISTANT:
                         with st.spinner("Reading the dashboard and searching..."):
                             agent = get_financial_agent()
                             if not agent:
-                                answer = ("⚠️ Configure GOOGLE_API_KEY (or GEMINI_API_KEY) "
-                                          "in your `.env`.")
+                                answer = f"⚠️ {llm_factory.missing_credentials_message()}"
                             else:
                                 try:
                                     from langchain_core.messages import AIMessage, HumanMessage
@@ -1628,7 +1651,7 @@ if SHOW_TAB_CHATBOT:
                 with st.spinner("Agent is researching and thinking..."):
                     agent = get_financial_agent()
                     if not agent:
-                        response = "⚠️ Please ensure GOOGLE_API_KEY (or GEMINI_API_KEY) is configured in your .env file."
+                        response = f"⚠️ {llm_factory.missing_credentials_message()}"
                     else:
                         try:
                             from langchain_core.messages import HumanMessage, AIMessage

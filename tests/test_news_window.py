@@ -95,9 +95,20 @@ def test_an_empty_window_is_reported_rather_than_scored(patched, monkeypatch):
     assert called == [], "the model must not be called with an empty window"
 
 
-def test_missing_credentials_are_reported_before_any_fetch(monkeypatch):
+@pytest.mark.parametrize("provider, expected", [
+    ("gemini", "GOOGLE_API_KEY"),
+    ("deepseek", "AZURE_INFERENCE_ENDPOINT"),
+])
+def test_missing_credentials_are_reported_before_any_fetch(monkeypatch, provider,
+                                                           expected):
+    """The message must follow the sidebar's provider switch: naming the wrong
+    provider's variable sends the user to fix a setting that is already right."""
     monkeypatch.setattr(sentiment.llm_factory, "credentials_present", lambda: False)
-    assert "Gemini API key" in sentiment.get_recent_sentiment("AAA")["error"]
+    sentiment.llm_factory.set_provider(provider)
+    try:
+        assert expected in sentiment.get_recent_sentiment("AAA")["error"]
+    finally:
+        sentiment.llm_factory.set_provider(None)
 
 
 def test_prompt_text_renders_a_scored_window():
