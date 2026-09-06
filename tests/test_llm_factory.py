@@ -216,3 +216,104 @@ def test_preview_and_experimental_models_are_not_suggested_as_the_fix(keyed, mon
     suggestion = text.split("Flash models available: ")[1].split("\n")[0]
     assert "gemini-2.5-flash" in suggestion
     assert "preview" not in suggestion
+
+
+# ---------------------------------------------------------------------------
+# Key doctor — "API key not valid" means a value was found and rejected
+# ---------------------------------------------------------------------------
+
+VALID_SHAPE = "AIza" + "b" * 35   # 39 chars, correct prefix
+
+
+def _in_dir(monkeypatch, tmp_path, env_text=None):
+    monkeypatch.chdir(tmp_path)
+    if env_text is not None:
+        (tmp_path / ".env").write_text(env_text)
+
+
+def test_a_shell_export_silently_beating_dotenv_is_caught(monkeypatch, tmp_path):
+    """load_dotenv does not override an exported variable, and nothing says so —
+    the app then uses a stale key while .env looks correct."""
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    stale = "AIza" + "z" * 35
+    monkeypatch.setenv("GOOGLE_API_KEY", stale)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", stale)
+
+    problems = " ".join(llm_factory.diagnose_key()["problems"])
+    assert "does NOT match the one in .env" in problems
+    assert "unset GOOGLE_API_KEY" in problems
+
+
+def test_a_matching_key_is_not_reported_as_overridden(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    assert llm_factory.diagnose_key()["problems"] == []
+
+
+def test_quotes_stripped_by_dotenv_are_not_flagged(monkeypatch, tmp_path):
+    """Regression: the raw file was inspected, so standard quoting — which
+    python-dotenv strips — produced a false alarm."""
+    _in_dir(monkeypatch, tmp_path, f'GOOGLE_API_KEY="{VALID_SHAPE}"\n')
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    assert llm_factory.diagnose_key()["problems"] == []
+
+
+def test_quotes_that_survive_into_the_value_are_flagged(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    quoted = f'"{VALID_SHAPE}"'
+    monkeypatch.setenv("GOOGLE_API_KEY", quoted)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", quoted)
+    assert any("wrapped in quotes" in p for p in llm_factory.diagnose_key()["problems"])
+
+
+def test_a_wrong_prefix_suggests_it_is_not_an_api_key(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GOOGLE_API_KEY", "ya29." + "x" * 34)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "ya29." + "x" * 34)
+    problems = " ".join(llm_factory.diagnose_key()["problems"])
+    assert "does not start with 'AIza'" in problems
+    assert "OAuth client id" in problems
+
+
+def test_a_truncated_key_is_caught_by_length(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIzaShort")
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "AIzaShort")
+    assert any("characters; Google API keys are 39" in p
+               for p in llm_factory.diagnose_key()["problems"])
+
+
+def test_whitespace_around_the_value_is_caught(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path, "")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE + " ")
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE + " ")
+    assert any("whitespace" in p for p in llm_factory.diagnose_key()["problems"])
+
+
+def test_a_missing_env_file_is_reported(monkeypatch, tmp_path):
+    _in_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "")
+    report = llm_factory.diagnose_key()
+    assert any("no .env file found" in f for f in report["findings"])
+
+
+def test_a_well_formed_key_says_the_loading_is_fine(monkeypatch, tmp_path):
+    """So a genuinely revoked key is not mistaken for a config problem."""
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
+    assert "Nothing wrong" in text
+    assert "invalid or revoked" in text
+
+
+def test_the_diagnosis_never_prints_the_key(monkeypatch, tmp_path):
+    """It reports shape — length, prefix, last four — and nothing more."""
+    _in_dir(monkeypatch, tmp_path, f"GOOGLE_API_KEY={VALID_SHAPE}\n")
+    monkeypatch.setenv("GOOGLE_API_KEY", VALID_SHAPE)
+    monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", VALID_SHAPE)
+    text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
+    assert VALID_SHAPE not in text
+    assert VALID_SHAPE[:20] not in text
