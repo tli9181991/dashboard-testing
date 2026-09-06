@@ -1225,7 +1225,7 @@ if SHOW_TAB_SENTIMENT:
         sentiment_ticker = st.selectbox("Select Asset for AI Analysis:", monitored_tickers, key="sentiment_box")
         st.subheader(f"AI News Synthesis ({sentiment_ticker})")
         
-        # Auth is read from AZURE_INFERENCE_ENDPOINT / AZURE_INFERENCE_CREDENTIAL in config.py
+        # Auth is read from GOOGLE_API_KEY / GEMINI_API_KEY in config.py
         sentiment_payload = get_hourly_sentiment(sentiment_ticker)
                 
         if "error" in sentiment_payload:
@@ -1534,8 +1534,8 @@ if SHOW_TAB_ASSISTANT:
                         with st.spinner("Reading the dashboard and searching..."):
                             agent = get_financial_agent()
                             if not agent:
-                                answer = ("⚠️ Configure AZURE_INFERENCE_ENDPOINT and "
-                                          "AZURE_INFERENCE_CREDENTIAL in your `.env`.")
+                                answer = ("⚠️ Configure GOOGLE_API_KEY (or GEMINI_API_KEY) "
+                                          "in your `.env`.")
                             else:
                                 try:
                                     from langchain_core.messages import AIMessage, HumanMessage
@@ -1628,7 +1628,7 @@ if SHOW_TAB_CHATBOT:
                 with st.spinner("Agent is researching and thinking..."):
                     agent = get_financial_agent()
                     if not agent:
-                        response = "⚠️ Please ensure AZURE_INFERENCE_ENDPOINT and AZURE_INFERENCE_CREDENTIAL are configured in your .env file."
+                        response = "⚠️ Please ensure GOOGLE_API_KEY (or GEMINI_API_KEY) is configured in your .env file."
                     else:
                         try:
                             from langchain_core.messages import HumanMessage, AIMessage

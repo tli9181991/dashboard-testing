@@ -1,17 +1,16 @@
 import os
 import yfinance as yf
-from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_community.tools import DuckDuckGoSearchRun
 
-from config import AZURE_INFERENCE_ENDPOINT, AZURE_INFERENCE_CREDENTIAL, DEEPSEEK_MODEL_NAME
+import llm as llm_factory
 import agent_tools
 
 def get_financial_agent():
     """Initializes a native LangChain tool-calling agent with memory, backed by
-    DeepSeek V4 Flash deployed in Azure AI Foundry."""
-    if not AZURE_INFERENCE_ENDPOINT or not AZURE_INFERENCE_CREDENTIAL:
+    Gemini via langchain-google-genai."""
+    if not llm_factory.credentials_present():
         return None
 
     @tool
@@ -144,19 +143,14 @@ def get_financial_agent():
         """Use this to search the web for the latest news, market events, or macroeconomic updates regarding a stock."""
         return search_tool.run(query)
 
-    # Bind tools directly to the DeepSeek V4 Flash LLM (via Azure AI Foundry)
+    # Bind the tools to the Gemini model built by llm.get_chat_model
     tools = [
         get_stock_fundamentals, get_historical_performance, web_news_search,
         check_earnings, validate_trade_plan, check_signal_now,
         get_support_resistance, size_position, random_entry_test,
         check_swing_setups, screen_symbol, backtest_strategy, scan_watchlist,
     ]
-    llm = AzureAIChatCompletionsModel(
-        endpoint=AZURE_INFERENCE_ENDPOINT,
-        credential=AZURE_INFERENCE_CREDENTIAL,
-        model=DEEPSEEK_MODEL_NAME,
-        temperature=0.1,
-    ).bind_tools(tools)
+    llm = llm_factory.get_chat_model(temperature=0.1).bind_tools(tools)
     tools_map = {t.name: t for t in tools}
 
     BASE_SYSTEM = (
