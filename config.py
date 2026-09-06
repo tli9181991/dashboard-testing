@@ -15,7 +15,7 @@ def parse_bool(val: str, default: bool) -> bool:
 # GEMINI_API_KEY is accepted too, because both names are in common use and
 # silently ignoring the one that was actually set is a bad first five minutes.
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or ""
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.6-flash")
 INITIAL_ETH_PRICE = float(os.getenv("INITIAL_ETH_PRICE", "2300.0"))
 DEFAULT_POS_SIZE_USD = float(os.getenv("POS_SIZE_USD", "500.0"))
 DEFAULT_MAX_POS = int(os.getenv("MAX_POS", "5"))

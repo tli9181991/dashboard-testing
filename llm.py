@@ -8,7 +8,12 @@ a provider migration turns into a scavenger hunt.
 Credentials come from ``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY``:
 ``langchain-google-genai`` reads the first from the environment itself, but both
 names are in common use and silently ignoring the one the user actually set is a
-bad first five minutes.
+bad first five minutes. The key is loaded from ``.env`` by ``config``, so nothing
+here needs a notebook-specific secrets store.
+
+``gemini-flash-latest`` is a valid alternative to a pinned id and always points at
+the current Flash model — convenient, at the cost of the model changing under you
+without a code change.
 """
 
 from __future__ import annotations
@@ -37,9 +42,12 @@ def get_chat_model(temperature: float = 0.0, model: str | None = None):
 
     from langchain_google_genai import ChatGoogleGenerativeAI
 
+    # `api_key` rather than `google_api_key`: the field carries both names, but
+    # this is the spelling in the snippet confirmed working against this key, and
+    # matching it exactly removes one variable from any future debugging.
     return ChatGoogleGenerativeAI(
         model=model or GEMINI_MODEL_NAME,
-        google_api_key=GOOGLE_API_KEY,
+        api_key=GOOGLE_API_KEY,
         temperature=temperature,
     )
 

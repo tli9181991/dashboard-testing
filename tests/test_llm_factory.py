@@ -25,9 +25,9 @@ def test_building_without_a_key_raises_rather_than_half_building(monkeypatch):
 
 def test_the_model_carries_the_configured_name(monkeypatch):
     monkeypatch.setattr(llm_factory, "GOOGLE_API_KEY", "abc123")
-    monkeypatch.setattr(llm_factory, "GEMINI_MODEL_NAME", "gemini-3.5-flash")
+    monkeypatch.setattr(llm_factory, "GEMINI_MODEL_NAME", "gemini-3.6-flash")
     model = llm_factory.get_chat_model()
-    assert "gemini-3.5-flash" in str(model.model)
+    assert "gemini-3.6-flash" in str(model.model)
 
 
 def test_an_explicit_model_overrides_the_default(monkeypatch):
@@ -198,7 +198,7 @@ def test_a_configured_model_missing_from_the_list_is_called_out(keyed, monkeypat
          "supportedGenerationMethods": ["generateContent"]},
     ]}))
     text = llm_factory.render_models(llm_factory.list_models(),
-                                     configured="gemini-3.5-flash")
+                                     configured="gemini-3.6-flash")
     assert "is NOT in the list" in text
     assert "gemini-2.5-flash" in text
     assert "Set GEMINI_MODEL_NAME" in text
