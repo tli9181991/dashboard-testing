@@ -77,10 +77,7 @@ def list_models(timeout: int = 20) -> dict:
             detail = response.json().get("error", {}).get("message", "")
         except Exception:
             detail = response.text[:200]
-        hint = ""
-        if response.status_code in (401, 403):
-            hint = (" Check the key is valid and that the Generative Language "
-                    "API is enabled for its project.")
+        hint = _http_hint(response.status_code, detail)
         return {"models": [],
                 "error": f"HTTP {response.status_code} listing models. {detail}{hint}"}
 
@@ -94,6 +91,41 @@ def list_models(timeout: int = 20) -> dict:
             "input_token_limit": entry.get("inputTokenLimit"),
         })
     return {"models": sorted(usable, key=lambda m: m["id"]), "error": ""}
+
+
+def _http_hint(status_code: int, detail: str) -> str:
+    """Turn Google's error into the specific console fix.
+
+    The two 403s look alike and have different remedies: a key whose *API
+    restriction* list excludes this API, versus an API that was never *enabled*
+    for the project. Google words them differently, so they can be told apart.
+    """
+    lowered = (detail or "").lower()
+
+    if "are blocked" in lowered or "api_key_service_blocked" in lowered:
+        return (
+            "\n\nThis is the API key's own restriction list, not the key's validity — "
+            "the key is fine, it is just not allowed to call this API.\n"
+            "Fix it in the Google Cloud console:\n"
+            "  1. APIs & Services > Library > enable 'Generative Language API'\n"
+            "     for this key's project. It must be enabled before it can be\n"
+            "     selected in step 2.\n"
+            "  2. APIs & Services > Credentials > your key > API restrictions:\n"
+            "     add 'Generative Language API' to the allowed list, or choose\n"
+            "     'Don't restrict key' to confirm the diagnosis quickly.\n"
+            "Restrictions can take a minute or two to propagate."
+        )
+
+    if "has not been used" in lowered or "is disabled" in lowered:
+        return (
+            "\n\nThe Generative Language API is not enabled for this key's project.\n"
+            "Enable it at APIs & Services > Library, then retry."
+        )
+
+    if status_code in (401, 403):
+        return (" Check the key is valid and that the Generative Language API is "
+                "enabled for its project.")
+    return ""
 
 
 def render_models(payload: dict, configured: str | None = None) -> str:

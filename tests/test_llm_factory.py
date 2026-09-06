@@ -317,3 +317,51 @@ def test_the_diagnosis_never_prints_the_key(monkeypatch, tmp_path):
     text = llm_factory.render_diagnosis(llm_factory.diagnose_key())
     assert VALID_SHAPE not in text
     assert VALID_SHAPE[:20] not in text
+
+
+# ---------------------------------------------------------------------------
+# 403s that look alike and need different fixes
+# ---------------------------------------------------------------------------
+
+BLOCKED = ("Requests to this API generativelanguage.googleapis.com method "
+           "google.ai.generativelanguage.v1beta.ModelService.ListModels are blocked.")
+NOT_ENABLED = ("Generative Language API has not been used in project 12345 before "
+               "or it is disabled.")
+
+
+def test_a_key_restriction_is_named_as_such(keyed, monkeypatch):
+    """The key is valid; its allowed-API list just excludes this API. Saying
+    "check the key is valid" would send the user to rotate a working key."""
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": BLOCKED}}))
+    error = llm_factory.list_models()["error"]
+    assert "the key is fine" in error
+    assert "API restrictions" in error
+    assert "Don't restrict key" in error
+
+
+def test_a_disabled_api_gets_the_other_fix(keyed, monkeypatch):
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": NOT_ENABLED}}))
+    error = llm_factory.list_models()["error"]
+    assert "not enabled for this key's project" in error
+    assert "Library" in error
+
+
+def test_the_two_403s_do_not_get_the_same_advice(keyed, monkeypatch):
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": BLOCKED}}))
+    blocked = llm_factory.list_models()["error"]
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": NOT_ENABLED}}))
+    disabled = llm_factory.list_models()["error"]
+    assert blocked != disabled
+
+
+def test_an_unrecognised_403_still_gets_generic_advice(keyed, monkeypatch):
+    _patch_get(monkeypatch, _Response(403, {"error": {"message": "something else"}}))
+    assert "Check the key is valid" in llm_factory.list_models()["error"]
+
+
+def test_an_invalid_key_is_not_treated_as_a_restriction(keyed, monkeypatch):
+    """A 400 on the key value must not send the user into the restrictions page."""
+    _patch_get(monkeypatch, _Response(400, {"error": {"message": "API key not valid"}}))
+    error = llm_factory.list_models()["error"]
+    assert "API key not valid" in error
+    assert "API restrictions" not in error
